@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Inference Trajectory Viewer</title>
+  <link rel="stylesheet" href="style.css" />
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+      }
+    }
+  </script>
+</head>
+<body>
+  <canvas id="c"></canvas>
+  <div id="hud">
+    <div class="hud-title">Inference Trajectory</div>
+    <div class="hud-row"><span>Token</span><strong id="hud-token">-</strong></div>
+    <div class="hud-row"><span>Entropy</span><strong id="hud-entropy">-</strong></div>
+    <div class="hud-row"><span>Margin</span><strong id="hud-margin">-</strong></div>
+    <div class="hud-row"><span>Drift</span><strong id="hud-drift">-</strong></div>
+    <div class="hud-row"><span>Top-K</span><strong id="hud-topk">-</strong></div>
+    <div class="hud-row"><span>Rate</span><strong id="hud-rate">6 t/s</strong></div>
+    <div class="hud-legend">X: Entropy · Y: Margin · Z: Drift</div>
+    <div class="hud-divider"></div>
+    <label class="hud-label" for="endpoint-input">llama.cpp endpoint</label>
+    <input id="endpoint-input" class="hud-input" type="text" value="http://192.168.1.117:1234" />
+    <label class="hud-label" for="prompt-input">Prompt</label>
+    <textarea id="prompt-input" class="hud-input hud-textarea" rows="3" placeholder="Type a prompt..."></textarea>
+    <div class="hud-actions">
+      <button id="start-btn" class="hud-button hud-primary">Start</button>
+      <button id="stop-btn" class="hud-button">Stop</button>
+    </div>
+    <div id="hud-status" class="hud-status">Idle</div>
+    <div class="hud-foot">Mouse: orbit | Scroll: zoom | Shift+drag: pan</div>
+  </div>
+  <div id="transcript-panel">
+    <div class="transcript-title">Live Output</div>
+    <div id="transcript"></div>
+  </div>
+  <div id="banner">Live inference observability | logits + embeddings | deterministic 3D mapping</div>
+  <script type="module" src="app.js"></script>
+</body>
+</html>
