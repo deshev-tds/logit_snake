@@ -1,218 +1,212 @@
-# llama.cpp telemetry wrapper (MVP)
+# LLM Snake Scope (2D)
 
-Thin wrapper that talks to a local `llama-server` and emits JSONL telemetry to stdout.
+A local analyst-focused visualizer for autoregressive runs.
 
-## Why this exists
+This version is intentionally **2D + time-first**:
+- stable PCA projection of token vectors
+- replay controls and freeze frame
+- run-vs-run diff with alignment + delta summary
+- regime-shift markers
+- clickable token inspection (top-N alternatives)
+- token branching and regeneration
 
-We want live, near-live observability into autoregressive inference without touching training or proprietary internals.
-The point is to show that meaningful, stable telemetry can be derived from standard inference artifacts that every
-runtime already computes: logits, token IDs, embeddings (and optionally attention weights).
+## Quick Start
 
-This is not "model introspection" in the mystical sense. It is instrumentation of inference-time signals that already
-exist in the forward pass. The demo is meant to prove that these signals can be captured cheaply, mapped into a 3D
-trajectory, and used to visualize uncertainty, decisiveness, and semantic motion as text is generated.
+1. Start your inference backend (llama.cpp-compatible HTTP API).
+   - It should expose `/completion`.
+   - For best token alternatives, enable `n_probs` support.
+   - Optional: expose `/embedding` for real vectors.
 
-## Scientific basis (what the metrics are and where they come from)
+2. Start the visualizer server:
 
-All metrics are derived from one of three standard inference stages:
-
-1) Token sampling stage (mandatory in all autoregressive LLMs)
-   - Source: logits and probabilities produced at each decoding step.
-   - Entropy H(t) = -sum(p_i * log p_i). High H means many plausible continuations; low H means commitment.
-   - Logit margin M(t) = logit_top1 - logit_top2 (or top1/top2 prob ratio). High margin means decisive choice.
-   - Top-K mass = sum of top-K probabilities. High mass indicates distribution collapse / tunnel behavior.
-
-2) Representation / embedding stage (mandatory in transformer-based LLMs)
-   - Source: hidden-state embeddings (final layer for MVP).
-   - Semantic drift velocity is computed by pooling the last N token embeddings and measuring L2 distance to the
-     previous pooled window, normalized by token delta. Low drift means semantic continuity; high drift means
-     semantic motion or instability.
-
-3) Attention stage (optional, if exposed by runtime)
-   - Source: attention matrices by head/position.
-   - Attention concentration can be measured via entropy or Gini. If attention is unavailable, we approximate
-     concentration using entropy and top-K mass as proxies.
-
-These are standard statistical measures of uncertainty, separation, and representation drift. Nothing here requires
-training-time access, gradients, or proprietary internals.
-
-## What the demo is proving
-
-- Every metric in the visualization is grounded in standard inference artifacts (logits, embeddings, optional attention).
-- A deterministic, monotonic mapping from these metrics into 3D space yields a stable trajectory that reflects model
-  uncertainty (entropy), decisiveness (margin), and semantic motion (drift) in real time.
-- Regime boundaries ("tunnel", "spread", "vibe", etc.) are hypotheses layered on top of measured signals and can be
-  tested with prompt-controlled experiments and clustering.
-- Live observability is feasible without patching the runtime; deeper hooks can reduce latency or overhead later.
-
-## What it does
-
-- Calls `/completion` in small chunks (`--chunk-size`) to approximate near-live sampling without patching llama.cpp.
-- Uses `n_probs` to compute entropy, logit margin, and top-K mass per generated token.
-- Optionally calls `/embedding` on a rolling token window to compute semantic drift.
-- Optionally emits normalized 3D coordinates (the "snake") for direct visualization.
-- Emits JSONL records to stdout (one per telemetry sample) with a versioned schema.
-
-## 3D trajectory mapping (the "snake")
-
-For wider audiences, the demo is most compelling when the metrics become a visible, stable trajectory in 3D space.
-By default, the wrapper can emit normalized coordinates in [0, 1] that map directly to the three core signals:
-
-- X: entropy (uncertainty axis)
-- Y: logit margin (decisiveness axis)
-- Z: drift (semantic motion axis)
-
-The mapping is deterministic and monotonic (no learned projection). Each axis is normalized by a fixed max so that
-the geometry is comparable across runs. A light EMA can smooth jitter without hiding regime shifts.
-
-Defaults (configurable):
-
-- entropy_max = 8.0 nats
-- margin_max = 10.0 logprob delta
-- drift_max = 2.0 (L2 per token)
-- alpha = 0.2 (EMA smoothing factor)
-
-Disable or tune with:
-
-```
-python3 llama_telemetry.py \
-  --prompt "test" \
-  --emit-xyz \
-  --xyz-entropy-max 8.0 \
-  --xyz-margin-max 10.0 \
-  --xyz-drift-max 2.0 \
-  --xyz-alpha 0.2
-```
-
-## Requirements
-
-- `llama-server` running locally (default `http://127.0.0.1:8080`).
-- Start server with `--n-probs 20` (or higher) and `--embedding` if you want drift.
-
-Example server launch (adjust model path and params):
-
-```
-./llama-server -m /path/to/model.gguf --n-probs 20 --embedding
-```
-
-## Usage
-
-```
-python3 llama_telemetry.py \
-  --base-url http://127.0.0.1:8080 \
-  --prompt "Write a short paragraph about telemetry." \
-  --n-predict 128 \
-  --chunk-size 8
-```
-
-## Live 3D visualizer (browser)
-
-The viewer is a local web page powered by Three.js with mouse/trackpad orbit controls.
-It consumes JSONL from stdin or a file, streams it over Server-Sent Events, and renders the
-3D trajectory with token labels that always face the camera.
-
-Start/stop the visualizer server:
-
-```
+```bash
 ./viz_server.sh start
 ```
 
-Open:
+3. Open:
 
-```
+```text
 http://127.0.0.1:8765
 ```
 
-Use the UI to set the llama.cpp endpoint and prompt, then click Start.
+4. Enter endpoint + prompt and click **Generate Run**.
 
-Run telemetry and the visualizer together (pipe mode):
+## Controls
 
+- `Space`: play / pause
+- `Left` / `Right`: step timeline
+- `B`: bookmark current token index
+- `D`: toggle diff overlay
+- Click token: open alternatives popup
+- `1..5`: choose alternative token in popup
+- `Enter`: confirm branch generation
+
+## What Changed vs the Old 3D Version
+
+- Removed Three.js 3D camera-centric workflow from the main UX.
+- Added deterministic 2D projection with cached PCA coordinates.
+- Added run management (`Run A`, `Run B`), diff overlay, and alignment summary.
+- Added per-token chips with top-N alternatives and branch regeneration.
+- Added actionable time-series metrics (entropy, margin, velocity, curvature).
+
+## Run JSON Schema (Expected Format)
+
+The app accepts and emits this schema (version `2.0`):
+
+```json
+{
+  "schema_version": "2.0",
+  "run_id": "run_abc123",
+  "meta": {
+    "label": "Run",
+    "prompt": "...",
+    "prompt_hash": "...",
+    "timestamp": "2026-02-14T12:00:00+00:00",
+    "base_url": "http://127.0.0.1:8080",
+    "model": "...",
+    "status": "complete",
+    "generation_settings": {
+      "max_tokens": 256,
+      "chunk_size": 16,
+      "top_n": 5,
+      "n_probs": 20,
+      "temperature": 0.7,
+      "top_p": 0.95,
+      "seed": 1234,
+      "vector_mode": "placeholder",
+      "vector_dim": 24
+    },
+    "branch": {
+      "parent_run_id": "run_parent",
+      "fork_index": 42,
+      "chosen_alt_token": {
+        "token_id": 123,
+        "token_text": " alternative",
+        "logprob": -2.11,
+        "prob": 0.12
+      },
+      "forcing_strategy": "append_prefix_fallback",
+      "timestamp": "2026-02-14T12:05:00+00:00"
+    }
+  },
+  "tokens": [
+    {
+      "index": 0,
+      "t": 12,
+      "text": "Hello",
+      "chosen_token_id": 123,
+      "chosen_token_text": "Hello",
+      "logprob": -0.03,
+      "prob": 0.97,
+      "entropy": 0.45,
+      "margin": 3.2,
+      "velocity": 0.0,
+      "curvature": null,
+      "embedding": [0.11, -0.05, 0.2, "..."],
+      "topN": [
+        {"token_id": 123, "token_text": "Hello", "logprob": -0.03, "prob": 0.97},
+        {"token_id": 998, "token_text": "Hi", "logprob": -3.1, "prob": 0.045}
+      ]
+    }
+  ],
+  "analysis": {
+    "regime_markers": [
+      {"index": 42, "reasons": ["velocity_spike", "entropy_slope_spike"]}
+    ]
+  },
+  "summary": {
+    "token_count": 256,
+    "entropy_avg": 1.33,
+    "velocity_max": 0.82,
+    "duration_ms": 8120
+  },
+  "bookmarks": [
+    {"index": 42, "label": "tone shift", "timestamp": "2026-02-14T12:06:00+00:00"}
+  ]
+}
 ```
-python3 llama_telemetry.py --prompt "test" --sample-tokens 1 --emit-xyz \
-  | python3 viz_server.py --port 8765
-```
 
-Then open:
+## Loading Two Runs for Diff Mode
 
-```
-http://127.0.0.1:8765
-```
+1. Generate runs from the UI, and/or load run JSON via **Load Run JSON**.
+2. Select runs in **Run A** and **Run B** dropdowns.
+3. Enable **Diff Overlay**.
+4. Read the summary panel:
+   - average aligned distance
+   - max distance spike
+   - first shift candidate over threshold
 
-Playback pacing is intentionally limited to ~6 tokens/sec (configurable via URL):
+### Alignment Strategy
 
-```
-http://127.0.0.1:8765/?rate=6&scale=10&maxPoints=2000&bloomStrength=2.2&bloomRadius=0.65&bloomThreshold=0.55&labels=0
-```
+- If lengths match: index-to-index alignment.
+- If lengths differ: monotonic sliding-window nearest-neighbor alignment in projected 2D space.
 
-Optional:
+## Token Branching
 
-```
-python3 llama_telemetry.py \
-  --prompt-file prompt.txt \
-  --topk 20 \
-  --sample-tokens 8 \
-  --sample-ms 150 \
-  --window-size 64 \
-  --embeddings
-```
+### How to Trigger
 
-Pass extra generation params (temperature, top_p, etc) via JSON:
+1. Click a token chip in the token panel.
+2. Choose an alternative token (mouse or keys `1..5`).
+3. Press **Create Branch** or `Enter`.
 
-```
-python3 llama_telemetry.py \
-  --prompt "test" \
-  --params generation.json
-```
+### Backend Requirements
 
-## JSONL schema (proposed, v1.0)
+Preferred:
+- `/completion` returns per-token probability data (`n_probs` / top-logprobs style).
 
-A `session_start` record is emitted first unless `--no-schema` is set. It includes the schema and units.
-Each telemetry record uses numeric types and units described in that schema.
+Fallback behavior when detailed alternatives are unavailable:
+- deterministic approximation for top-N alternatives.
 
-Record types:
+### Branch Regeneration Strategy
 
-- `session_start`
-  - `t_ms` (int, ms_since_start)
-  - `schema_version` (string)
-  - `schema` (object)
-  - `units` (object)
-  - `config` (object)
-  - `model` (object)
+Current implementation uses a deterministic, backend-compatible fallback:
+1. Keep original prompt + original token prefix up to `i-1`.
+2. Append chosen alternative token `i` to that prefix.
+3. Continue generation from `i+1` onward with same generation settings.
 
-- `telemetry`
-  - `t_ms` (int, ms_since_start)
-  - `token_index` (int, token_index)
-  - `token_id` (int, vocab_id)
-  - `token_text` (string)
-  - `position.x` (float, normalized_0_1) [present when emit-xyz is enabled]
-  - `position.y` (float, normalized_0_1) [present when emit-xyz is enabled]
-  - `position.z` (float, normalized_0_1) [present when emit-xyz is enabled]
-  - `metrics.entropy` (float, nats)
-  - `metrics.logit_margin` (float, logprob_delta)
-  - `metrics.topk_mass` (float, probability)
-  - `metrics.drift` (float, l2_per_token)
-  - `sample_reason` (string enum: interval_tokens | interval_time | event)
-  - `event` (string enum: entropy_spike | margin_drop | null)
+Branch metadata is persisted in `meta.branch`.
 
-- `session_end`
-  - `t_ms` (int, ms_since_start)
-  - `token_count` (int)
-  - `stop` (bool)
+## API Endpoints
 
-## Notes and limitations (MVP)
+- `GET /api/status`
+- `GET /api/runs`
+- `GET /api/run/<run_id>`
+- `POST /api/generate` (alias: `/api/start`)
+- `POST /api/branch`
+- `POST /api/stop`
+- `POST /api/import-run`
+- `GET /stream` (SSE run events)
 
-- Entropy is computed from top-K probabilities plus a single residual bucket (1 - topK). This is a lower-bound approximation of full-distribution entropy unless K is very large.
-- Drift uses `/embedding` on the last `--window-size` tokens, which requires an extra embedding call per telemetry sample.
-- `/completion` streaming does not include per-token probabilities in current llama.cpp, so the wrapper uses short non-streamed requests to approximate near-live sampling.
-- XYZ coordinates are normalized by fixed maxima and smoothed with an EMA. Adjust `--xyz-*` knobs if your model operates outside the defaults.
-- The visualizer loads Three.js from a CDN. If you need offline demo support, vendor the library locally.
+## Design Notes
 
-## Pinning llama.cpp commit
+### Projection Choice
 
-The wrapper reads a pinned commit hash from `llama_cpp_commit.txt`. You can auto-fill it from the running server:
+- High-dimensional vectors are projected to 2D with deterministic PCA.
+- In single-run mode: PCA fitted on Run A.
+- In diff mode: PCA fitted on concatenated vectors from Run A + Run B, so both trajectories share one coordinate frame.
+- Projection output is cached by `(run ids + token lengths)` for smooth replay.
 
-```
-python3 llama_telemetry.py --prompt "test" --n-predict 1 --pin-commit
-```
+### Regime Detection Heuristic
 
-If `/props` exposes `build_info`, the script will write the commit hash into `llama_cpp_commit.txt`.
+Markers are generated from token-index series:
+- embedding velocity spikes (`||v[i]-v[i-1]||`)
+- entropy slope spikes (`|H[i]-H[i-1]|`)
+
+Thresholds use a simple `mean + 2*std` rule with a minimum index gap to avoid marker spam.
+
+### Branch Forcing Approach
+
+- Uses append-prefix continuation fallback for broad backend compatibility.
+- Keeps settings deterministic (`seed`, `temperature`, `top_p`, etc.) from the parent run.
+- Stores branch lineage (`parent_run_id`, `fork_index`, chosen alternative, timestamp).
+
+## Legacy Compatibility
+
+- `jsonl` telemetry logs from the old pipeline can still be loaded.
+- A conversion layer maps legacy telemetry records into the new run schema.
+
+## Known Gaps / TODO
+
+- Optional strict token-forcing via backend-native logit bias when reliably supported.
+- More robust DTW-style alignment for very different-length outputs.
+- Explicit run persistence on disk (currently in-memory unless exported/imported).

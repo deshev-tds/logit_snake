@@ -3,45 +3,142 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Inference Trajectory Viewer</title>
+  <title>LLM Snake Scope</title>
   <link rel="stylesheet" href="style.css" />
-  <script type="importmap">
-    {
-      "imports": {
-        "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
-        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
-      }
-    }
-  </script>
 </head>
 <body>
-  <canvas id="c"></canvas>
-  <div id="hud">
-    <div class="hud-title">Inference Trajectory</div>
-    <div class="hud-row"><span>Token</span><strong id="hud-token">-</strong></div>
-    <div class="hud-row"><span>Entropy</span><strong id="hud-entropy">-</strong></div>
-    <div class="hud-row"><span>Margin</span><strong id="hud-margin">-</strong></div>
-    <div class="hud-row"><span>Drift</span><strong id="hud-drift">-</strong></div>
-    <div class="hud-row"><span>Top-K</span><strong id="hud-topk">-</strong></div>
-    <div class="hud-row"><span>Rate</span><strong id="hud-rate">6 t/s</strong></div>
-    <div class="hud-legend">X: Entropy · Y: Margin · Z: Drift</div>
-    <div class="hud-divider"></div>
-    <label class="hud-label" for="endpoint-input">llama.cpp endpoint</label>
-    <input id="endpoint-input" class="hud-input" type="text" value="http://192.168.1.117:1234" />
-    <label class="hud-label" for="prompt-input">Prompt</label>
-    <textarea id="prompt-input" class="hud-input hud-textarea" rows="3" placeholder="Type a prompt..."></textarea>
-    <div class="hud-actions">
-      <button id="start-btn" class="hud-button hud-primary">Start</button>
-      <button id="stop-btn" class="hud-button">Stop</button>
+  <div id="app">
+    <header id="topbar" class="panel">
+      <div class="title-wrap">
+        <h1>LLM Snake Scope</h1>
+        <p>2D trajectory replay, regime shifts, token alternatives, and branch diffs.</p>
+      </div>
+      <div id="generation-grid">
+        <label>Endpoint
+          <input id="endpoint-input" type="text" value="http://127.0.0.1:8080" />
+        </label>
+        <label>Prompt
+          <textarea id="prompt-input" rows="3" placeholder="Ask the model anything. This prompt defines Run A."></textarea>
+        </label>
+        <label>Seed
+          <input id="seed-input" type="number" value="1234" />
+        </label>
+        <label>Temperature
+          <input id="temperature-input" type="number" step="0.01" min="0" max="2" value="0.7" />
+        </label>
+        <label>Top P
+          <input id="top-p-input" type="number" step="0.01" min="0" max="1" value="0.95" />
+        </label>
+        <label>Max Tokens
+          <input id="max-tokens-input" type="number" min="1" max="4096" value="256" />
+        </label>
+      </div>
+      <div id="action-row">
+        <button id="generate-btn" class="accent">Generate Run</button>
+        <button id="stop-btn">Stop</button>
+        <button id="load-file-btn">Load Run JSON</button>
+        <button id="export-btn">Export Run A</button>
+        <input id="run-file-input" type="file" accept=".json,.jsonl,.txt" multiple hidden />
+        <span id="status-badge">Idle</span>
+      </div>
+      <div id="shortcut-hint">
+        Shortcuts: <kbd>Space</kbd> play/pause, <kbd>&larr;</kbd>/<kbd>&rarr;</kbd> step, <kbd>B</kbd> bookmark, <kbd>D</kbd> diff toggle, <kbd>1..5</kbd> choose alt, <kbd>Enter</kbd> branch.
+      </div>
+    </header>
+
+    <main id="workspace">
+      <section id="visual-panel" class="panel">
+        <div class="panel-head">
+          <div>
+            <h2>2D Snake</h2>
+            <p id="run-meta">No run selected.</p>
+          </div>
+          <div class="inline-controls">
+            <label>Run A
+              <select id="run-a-select"></select>
+            </label>
+            <label>Run B
+              <select id="run-b-select"></select>
+            </label>
+            <label class="checkbox-row">
+              <input type="checkbox" id="diff-toggle" />
+              Diff Overlay
+            </label>
+            <label>Shift Threshold
+              <input id="shift-threshold-input" type="number" step="0.01" min="0" value="0.18" />
+            </label>
+          </div>
+        </div>
+        <canvas id="snake-canvas"></canvas>
+        <div id="timeline-row">
+          <button id="play-btn" class="accent">Play</button>
+          <button id="step-back-btn">Step -1</button>
+          <button id="step-forward-btn">Step +1</button>
+          <label>Speed
+            <select id="speed-select">
+              <option value="0.5">0.5x</option>
+              <option value="1" selected>1x</option>
+              <option value="2">2x</option>
+              <option value="4">4x</option>
+            </select>
+          </label>
+          <label class="checkbox-row">
+            <input type="checkbox" id="freeze-toggle" />
+            Freeze
+          </label>
+          <input id="timeline-input" type="range" min="0" max="0" value="0" />
+          <span id="timeline-label">0 / 0</span>
+        </div>
+      </section>
+
+      <aside id="inspector-panel" class="panel">
+        <section class="subpanel" id="diff-panel">
+          <h3>Diff Summary</h3>
+          <div class="kv"><span>Avg Distance</span><strong id="diff-avg">-</strong></div>
+          <div class="kv"><span>Max Spike</span><strong id="diff-max">-</strong></div>
+          <div class="kv"><span>First Shift</span><strong id="diff-first">-</strong></div>
+          <div class="kv"><span>Alignment</span><strong id="diff-alignment">index</strong></div>
+        </section>
+
+        <section class="subpanel" id="bookmark-panel">
+          <div class="subpanel-head">
+            <h3>Bookmarks</h3>
+            <button id="bookmark-btn">Add</button>
+          </div>
+          <div id="bookmark-list"></div>
+        </section>
+
+        <section class="subpanel" id="token-panel">
+          <h3>Tokens</h3>
+          <div id="token-stream"></div>
+        </section>
+      </aside>
+    </main>
+
+    <section id="metrics-panel" class="panel">
+      <h2>Metrics Over Time</h2>
+      <div class="metric-grid">
+        <div class="metric-card"><h4>Entropy</h4><canvas id="metric-entropy"></canvas></div>
+        <div class="metric-card"><h4>Logit Margin</h4><canvas id="metric-margin"></canvas></div>
+        <div class="metric-card"><h4>Embedding Velocity</h4><canvas id="metric-velocity"></canvas></div>
+        <div class="metric-card"><h4>Curvature Proxy</h4><canvas id="metric-curvature"></canvas></div>
+      </div>
+    </section>
+  </div>
+
+  <div id="token-popup" class="hidden" role="dialog" aria-label="Token alternatives">
+    <div class="popup-head">
+      <strong id="popup-title">Token</strong>
+      <button id="popup-close">Close</button>
     </div>
-    <div id="hud-status" class="hud-status">Idle</div>
-    <div class="hud-foot">Mouse: orbit | Scroll: zoom | Shift+drag: pan</div>
+    <div id="popup-meta"></div>
+    <div id="popup-alt-list"></div>
+    <div class="popup-foot">
+      <button id="popup-confirm" class="accent">Create Branch</button>
+      <span id="popup-hint">Use 1..5 then Enter.</span>
+    </div>
   </div>
-  <div id="transcript-panel">
-    <div class="transcript-title">Live Output</div>
-    <div id="transcript"></div>
-  </div>
-  <div id="banner">Live inference observability | logits + embeddings | deterministic 3D mapping</div>
+
   <script type="module" src="app.js"></script>
 </body>
 </html>
