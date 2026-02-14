@@ -126,6 +126,36 @@ function hashString(input) {
   return h >>> 0;
 }
 
+function normalizeBaseUrl(rawValue) {
+  let raw = String(rawValue ?? '').trim();
+  if (!raw) return '';
+
+  // Guard against accidental concatenation while editing the endpoint field.
+  const starts = [];
+  for (const prefix of ['http://', 'https://']) {
+    let idx = raw.indexOf(prefix);
+    while (idx !== -1) {
+      starts.push(idx);
+      idx = raw.indexOf(prefix, idx + 1);
+    }
+  }
+  if (starts.length > 1) {
+    raw = raw.slice(Math.max(...starts));
+  }
+
+  if (!/^https?:\/\//i.test(raw)) {
+    raw = `http://${raw}`;
+  }
+
+  try {
+    const u = new URL(raw);
+    const path = u.pathname && u.pathname !== '/' ? u.pathname : '';
+    return `${u.protocol}//${u.host}${path}`.replace(/\/+$/, '');
+  } catch {
+    return '';
+  }
+}
+
 function mulberry32(seed) {
   let t = seed >>> 0;
   return function rand() {
@@ -1711,15 +1741,16 @@ function wireSSE() {
 
 async function startGeneration() {
   const prompt = ui.prompt.value.trim();
-  const baseUrl = ui.endpoint.value.trim();
+  const baseUrl = normalizeBaseUrl(ui.endpoint.value);
   if (!prompt) {
     setStatus('Prompt is required.', 'error');
     return;
   }
   if (!baseUrl) {
-    setStatus('Endpoint is required.', 'error');
+    setStatus('Endpoint is invalid.', 'error');
     return;
   }
+  ui.endpoint.value = baseUrl;
 
   const settings = {
     seed: asNumber(ui.seed.value, 1234),
@@ -1909,6 +1940,13 @@ function bindUI() {
     const files = Array.from(ui.fileInput.files);
     await loadRunsFromFiles(files);
     ui.fileInput.value = '';
+  });
+
+  ui.endpoint.addEventListener('blur', () => {
+    const normalized = normalizeBaseUrl(ui.endpoint.value);
+    if (normalized) {
+      ui.endpoint.value = normalized;
+    }
   });
 
   ui.runASelect.addEventListener('change', async () => {

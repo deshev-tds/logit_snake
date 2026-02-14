@@ -630,6 +630,35 @@ def read_json_body(handler):
         return {}
 
 
+def normalize_base_url(raw_value):
+    raw = str(raw_value or "").strip()
+    if not raw:
+        return ""
+
+    # Guard against accidental concatenation like:
+    # http://127.0.0.1:8080http://192.168.1.117:1234/
+    starts = []
+    for prefix in ("http://", "https://"):
+        idx = raw.find(prefix)
+        while idx != -1:
+            starts.append(idx)
+            idx = raw.find(prefix, idx + 1)
+    if len(starts) > 1:
+        raw = raw[max(starts) :]
+
+    parsed = urlparse(raw)
+    if not parsed.scheme:
+        raw = "http://" + raw
+        parsed = urlparse(raw)
+
+    if not parsed.scheme or not parsed.netloc:
+        raise ValueError("invalid base_url")
+
+    path = parsed.path or ""
+    normalized = f"{parsed.scheme}://{parsed.netloc}{path}".rstrip("/")
+    return normalized
+
+
 def broadcast_event(event):
     payload = json.dumps(event, ensure_ascii=True).encode("utf-8")
     with CLIENTS_LOCK:
@@ -1202,9 +1231,14 @@ class TelemetryHandler(SimpleHTTPRequestHandler):
 
         if path in ("/api/start", "/api/generate"):
             prompt = (body.get("prompt") or "").strip()
-            base_url = (body.get("base_url") or DEFAULTS["base_url"]).strip()
+            raw_base_url = body.get("base_url") or DEFAULTS["base_url"]
             if not prompt:
                 send_json(self, 400, {"error": "prompt is required"})
+                return
+            try:
+                base_url = normalize_base_url(raw_base_url)
+            except ValueError:
+                send_json(self, 400, {"error": "base_url is invalid"})
                 return
             if not base_url:
                 send_json(self, 400, {"error": "base_url is required"})
