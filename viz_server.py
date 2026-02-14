@@ -331,13 +331,48 @@ def extract_probs(response):
     return None
 
 
-def extract_stop_flag(response):
+def extract_stop_info(response):
     resp = first_response(response)
+    info = {
+        "stop": False,
+        "hard_stop": False,
+        "stopped_limit": False,
+        "finish_reason": None,
+    }
     if not isinstance(resp, dict):
-        return False
-    if resp.get("stop"):
-        return True
-    return bool(resp.get("stopped_eos") or resp.get("stopped_word") or resp.get("stopping_word"))
+        return info
+
+    stop_flag = bool(resp.get("stop"))
+    stopped_eos = bool(resp.get("stopped_eos"))
+    stopped_word = bool(resp.get("stopped_word") or resp.get("stopping_word"))
+    stopped_limit = bool(resp.get("stopped_limit"))
+
+    finish_reason = resp.get("finish_reason")
+    if finish_reason is None:
+        choices = resp.get("choices")
+        if isinstance(choices, list) and choices:
+            choice0 = choices[0]
+            if isinstance(choice0, dict):
+                finish_reason = choice0.get("finish_reason")
+
+    finish_reason_text = str(finish_reason).strip().lower() if finish_reason is not None else ""
+    if finish_reason_text in ("length", "max_tokens"):
+        stopped_limit = True
+
+    hard_stop = stopped_eos or stopped_word or finish_reason_text in (
+        "stop",
+        "eos",
+        "eos_token",
+        "stop_sequence",
+        "content_filter",
+        "tool_calls",
+    )
+
+    info["stop"] = stop_flag or hard_stop or stopped_limit
+    info["hard_stop"] = hard_stop
+    info["stopped_limit"] = stopped_limit
+    info["finish_reason"] = finish_reason
+    return info
 
 
 def sanitize_int(value, default_value, minimum=None, maximum=None):
@@ -911,7 +946,7 @@ def run_worker(run_id, stop_event):
                     raise
             content = extract_content(response)
             probs = extract_probs(response)
-            stopped = extract_stop_flag(response)
+            stop_info = extract_stop_info(response)
 
             emitted_this_chunk = 0
             chunk_time_ms = int((time.monotonic() - started) * 1000)
@@ -952,7 +987,17 @@ def run_worker(run_id, stop_event):
 
             if emitted_this_chunk == 0:
                 break
-            if stopped:
+            if stop_info.get("hard_stop"):
+                break
+            if stop_info.get("stop"):
+                # Some backends mark each n_predict boundary as stop=true.
+                # Continue unless this is a hard stop or we received a short final chunk.
+                if remaining <= 0:
+                    break
+                if stop_info.get("stopped_limit"):
+                    continue
+                if emitted_this_chunk >= chunk_size:
+                    continue
                 break
 
         with RUNS_LOCK:
