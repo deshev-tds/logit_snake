@@ -647,13 +647,37 @@ def broadcast_event(event):
 
 
 def fetch_model_name(base_url):
+    props_model = None
     try:
         props = http_get_json(build_url(base_url, "/props"), timeout=8)
+        if isinstance(props, dict):
+            candidate = props.get("model_path") or props.get("model")
+            if candidate and str(candidate).strip().lower() not in ("none", "null"):
+                return str(candidate)
+            props_model = candidate
     except Exception:
-        return None
-    if not isinstance(props, dict):
-        return None
-    return props.get("model_path") or props.get("model") or None
+        pass
+
+    # Router-style deployments can require explicit model names.
+    try:
+        models_resp = http_get_json(build_url(base_url, "/v1/models"), timeout=8)
+        data = models_resp.get("data") if isinstance(models_resp, dict) else None
+        if isinstance(data, list):
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                status = item.get("status")
+                if isinstance(status, dict) and status.get("value") == "loaded" and item.get("id"):
+                    return str(item.get("id"))
+            for item in data:
+                if isinstance(item, dict) and item.get("id"):
+                    return str(item.get("id"))
+    except Exception:
+        pass
+
+    if props_model and str(props_model).strip().lower() not in ("none", "null"):
+        return str(props_model)
+    return None
 
 
 def sanitize_settings(raw_settings):
@@ -725,7 +749,7 @@ def append_token(run_id, token):
     return True
 
 
-def generate_completion_chunk(base_url, prompt, chunk_size, settings):
+def generate_completion_chunk(base_url, prompt, chunk_size, settings, model_name=None):
     payload = {
         "prompt": prompt,
         "n_predict": chunk_size,
@@ -739,6 +763,8 @@ def generate_completion_chunk(base_url, prompt, chunk_size, settings):
         "top_p": settings.get("top_p"),
         "seed": settings.get("seed"),
     }
+    if model_name and str(model_name).strip().lower() not in ("none", "null"):
+        payload["model"] = model_name
     extra = settings.get("extra_params") or {}
     payload.update(extra)
     return http_post_json(build_url(base_url, "/completion"), payload)
@@ -803,6 +829,7 @@ def run_worker(run_id, stop_event):
         prompt_hash = meta["prompt_hash"]
         base_url = meta["base_url"]
         inference_prompt = meta.get("inference_prompt") or meta.get("prompt", "")
+        model_name = meta.get("model")
 
         vector_provider = VectorProvider(
             settings.get("vector_mode", "placeholder"),
@@ -824,7 +851,35 @@ def run_worker(run_id, stop_event):
 
         while remaining > 0 and not stop_event.is_set():
             chunk_size = min(settings.get("chunk_size", DEFAULTS["chunk_size"]), remaining)
-            response = generate_completion_chunk(base_url, inference_prompt + generated_text, chunk_size, settings)
+            try:
+                response = generate_completion_chunk(
+                    base_url,
+                    inference_prompt + generated_text,
+                    chunk_size,
+                    settings,
+                    model_name=model_name,
+                )
+            except Exception as req_err:
+                req_msg = str(req_err)
+                if "model name is missing" in req_msg.lower():
+                    refreshed_model = fetch_model_name(base_url)
+                    if refreshed_model:
+                        model_name = refreshed_model
+                        with RUNS_LOCK:
+                            live_run = RUNS.get(run_id)
+                            if live_run is not None:
+                                live_run["meta"]["model"] = refreshed_model
+                        response = generate_completion_chunk(
+                            base_url,
+                            inference_prompt + generated_text,
+                            chunk_size,
+                            settings,
+                            model_name=model_name,
+                        )
+                    else:
+                        raise
+                else:
+                    raise
             content = extract_content(response)
             probs = extract_probs(response)
             stopped = extract_stop_flag(response)
@@ -889,14 +944,17 @@ def run_worker(run_id, stop_event):
                 }
     except Exception as err:
         error_message = str(err)
+        sys.stderr.write(f"Run {run_id} failed: {error_message}\n")
         with RUNS_LOCK:
             failed = RUNS.get(run_id)
             if failed is not None:
                 failed["meta"]["status"] = "error"
                 failed["meta"]["completed_at"] = utc_now_iso()
+                failed["meta"]["error"] = error_message
                 failed["summary"] = {
                     "token_count": len(failed.get("tokens") or []),
                     "duration_ms": int((time.monotonic() - started) * 1000),
+                    "error": error_message,
                 }
 
     with RUNS_LOCK:

@@ -1,2 +1,7 @@
+# Runtime artifacts
+*.pid
+*.log
+
+# Visualizer-specific runtime files
 .viz_server.pid
 viz_server.log

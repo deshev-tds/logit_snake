@@ -1347,7 +1347,11 @@ function drawSnakeCanvas() {
   if (!runA || !runA.tokens.length) {
     ctx.fillStyle = '#5d7084';
     ctx.font = '14px "IBM Plex Mono"';
-    ctx.fillText('No run data loaded.', 48, 54);
+    const message =
+      runA?.meta?.status === 'error'
+        ? `Run failed: ${runA?.meta?.error || runA?.summary?.error || 'unknown error'}`
+        : 'No run data loaded.';
+    ctx.fillText(message, 48, 54);
     return;
   }
 
@@ -1676,7 +1680,13 @@ function wireSSE() {
       if (state.runAId === payload.run.run_id) {
         renderTokens(true);
       }
-      setStatus(`Run completed: ${payload.run.run_id}`, 'success');
+      const runStatus = payload.run?.meta?.status;
+      const runError = payload.run?.meta?.error || payload.run?.summary?.error;
+      if (runStatus === 'error') {
+        setStatus(`Run failed: ${runError || payload.run.run_id}`, 'error');
+      } else {
+        setStatus(`Run completed: ${payload.run.run_id}`, 'success');
+      }
       state.needsRender = true;
       return;
     }
