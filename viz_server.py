@@ -635,6 +635,9 @@ def detect_regime_markers(tokens):
 def run_summary(run):
     meta = run.get("meta", {})
     branch = meta.get("branch") or {}
+    branch_history = meta.get("branch_history")
+    if not isinstance(branch_history, list):
+        branch_history = []
     return {
         "run_id": run.get("run_id"),
         "label": meta.get("label"),
@@ -644,6 +647,7 @@ def run_summary(run):
         "timestamp": meta.get("timestamp"),
         "parent_run_id": branch.get("parent_run_id"),
         "fork_index": branch.get("fork_index"),
+        "mutation_count": len(branch_history),
     }
 
 
@@ -767,11 +771,21 @@ def sanitize_settings(raw_settings):
     return settings
 
 
-def create_run_object(prompt, base_url, settings, label=None, branch_meta=None, prefill_tokens=None, inference_prompt=None):
+def create_run_object(
+    prompt,
+    base_url,
+    settings,
+    label=None,
+    branch_meta=None,
+    branch_history=None,
+    prefill_tokens=None,
+    inference_prompt=None,
+):
     run_id = f"run_{uuid.uuid4().hex[:12]}"
     prompt_hash = short_hash(prompt)
     model_name = fetch_model_name(base_url)
     base_tokens = copy.deepcopy(prefill_tokens or [])
+    clean_branch_history = copy.deepcopy(branch_history) if isinstance(branch_history, list) else []
 
     run = {
         "schema_version": "2.0",
@@ -788,6 +802,7 @@ def create_run_object(prompt, base_url, settings, label=None, branch_meta=None, 
             "status": "running",
             "generation_settings": settings,
             "branch": branch_meta,
+            "branch_history": clean_branch_history,
             "inference_prompt": inference_prompt if inference_prompt is not None else prompt,
             "providers": {
                 "topN": "backend_logprobs",
@@ -1121,6 +1136,7 @@ def build_branch_run(body):
 
     alt_rank = body.get("alt_rank")
     chosen_alt = None
+    chosen_rank = None
     if alt_rank is not None:
         try:
             alt_rank = int(alt_rank)
@@ -1129,18 +1145,22 @@ def build_branch_run(body):
         if alt_rank < 0 or alt_rank >= len(topn):
             raise ValueError("alt_rank out of range")
         chosen_alt = topn[alt_rank]
+        chosen_rank = alt_rank
     else:
         requested_id = body.get("alt_token_id")
         requested_text = body.get("alt_token_text")
-        for item in topn:
+        for rank, item in enumerate(topn):
             if requested_id is not None and item.get("token_id") == requested_id:
                 chosen_alt = item
+                chosen_rank = rank
                 break
             if requested_text is not None and item.get("token_text") == requested_text:
                 chosen_alt = item
+                chosen_rank = rank
                 break
         if chosen_alt is None and topn:
             chosen_alt = topn[0]
+            chosen_rank = 0
 
     if chosen_alt is None:
         raise ValueError("no alternative token available")
@@ -1165,6 +1185,22 @@ def build_branch_run(body):
     parent_meta = parent.get("meta", {})
     parent_settings = copy.deepcopy(parent_meta.get("generation_settings") or {})
     parent_prompt = parent_meta.get("prompt", "")
+    raw_parent_history = parent_meta.get("branch_history")
+    parent_history = copy.deepcopy(raw_parent_history) if isinstance(raw_parent_history, list) else []
+    branch_timestamp = utc_now_iso()
+    branch_mutation = {
+        "parent_run_id": run_id,
+        "fork_index": fork_index,
+        "alt_rank": chosen_rank,
+        "from_token_id": target.get("chosen_token_id"),
+        "from_text": target.get("text") or target.get("chosen_token_text") or "",
+        "to_token_id": chosen_alt.get("token_id"),
+        "to_text": chosen_alt.get("token_text") or "",
+        "logprob": chosen_alt.get("logprob"),
+        "prob": chosen_alt.get("prob"),
+        "timestamp": branch_timestamp,
+    }
+    branch_history = parent_history + [branch_mutation]
 
     forced_prefix = "".join(tok.get("text", "") for tok in prefill_tokens)
     inference_prompt = parent_prompt + forced_prefix
@@ -1172,13 +1208,14 @@ def build_branch_run(body):
     branch_meta = {
         "parent_run_id": run_id,
         "fork_index": fork_index,
+        "alt_rank": chosen_rank,
         "chosen_alt_token": {
             "token_id": chosen_alt.get("token_id"),
             "token_text": chosen_alt.get("token_text"),
             "logprob": chosen_alt.get("logprob"),
             "prob": chosen_alt.get("prob"),
         },
-        "timestamp": utc_now_iso(),
+        "timestamp": branch_timestamp,
         "forcing_strategy": "append_prefix_fallback",
     }
 
@@ -1190,6 +1227,7 @@ def build_branch_run(body):
         settings=sanitize_settings(parent_settings),
         label=label,
         branch_meta=branch_meta,
+        branch_history=branch_history,
         prefill_tokens=prefill_tokens,
         inference_prompt=inference_prompt,
     )
@@ -1320,6 +1358,8 @@ class TelemetryHandler(SimpleHTTPRequestHandler):
             run_copy["meta"].setdefault("timestamp", utc_now_iso())
             run_copy["meta"].setdefault("status", "complete")
             run_copy["meta"].setdefault("label", "Imported")
+            if not isinstance(run_copy["meta"].get("branch_history"), list):
+                run_copy["meta"]["branch_history"] = []
             run_copy.setdefault("tokens", [])
             run_copy.setdefault("analysis", {})
             run_copy.setdefault("summary", {})

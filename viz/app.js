@@ -34,6 +34,8 @@ const ui = {
 
   bookmarkBtn: document.getElementById('bookmark-btn'),
   bookmarkList: document.getElementById('bookmark-list'),
+  mutationCount: document.getElementById('mutation-count'),
+  mutationList: document.getElementById('mutation-list'),
 
   tokenStream: document.getElementById('token-stream'),
 
@@ -97,6 +99,8 @@ const state = {
   needsRender: true,
   lastIndex: -1,
   tokenNodes: [],
+  mutationIndices: new Set(),
+  latestMutationIndex: null,
   popup: null,
   diffContext: null,
   serverRunning: false,
@@ -500,24 +504,26 @@ function detectRegimeMarkers(run) {
 }
 
 function finalizeRun(rawRun, source = 'server') {
+  const rawMeta = (rawRun?.meta && typeof rawRun.meta === 'object') ? rawRun.meta : {};
   const run = {
     schema_version: String(rawRun?.schema_version ?? '2.0'),
     run_id: String(rawRun?.run_id || `local_${Date.now()}_${Math.floor(Math.random() * 1e6)}`),
     tokens: [],
     bookmarks: Array.isArray(rawRun?.bookmarks) ? rawRun.bookmarks.slice() : [],
     meta: {
-      ...((rawRun?.meta && typeof rawRun.meta === 'object') ? rawRun.meta : {}),
-      label: rawRun?.meta?.label || 'Run',
-      timestamp: rawRun?.meta?.timestamp || new Date().toISOString(),
-      status: rawRun?.meta?.status || 'complete',
+      ...rawMeta,
+      label: rawMeta.label || 'Run',
+      timestamp: rawMeta.timestamp || new Date().toISOString(),
+      status: rawMeta.status || 'complete',
       prompt_hash:
-        rawRun?.meta?.prompt_hash ||
-        `${hashString(rawRun?.meta?.prompt || rawRun?.run_id || 'run').toString(16)}`,
+        rawMeta.prompt_hash ||
+        `${hashString(rawMeta.prompt || rawRun?.run_id || 'run').toString(16)}`,
     },
     analysis: (rawRun?.analysis && typeof rawRun.analysis === 'object') ? rawRun.analysis : {},
     summary: (rawRun?.summary && typeof rawRun.summary === 'object') ? rawRun.summary : {},
     source,
   };
+  run.meta.branch_history = normalizeBranchHistory(run.meta);
 
   const rawTokens = Array.isArray(rawRun?.tokens) ? rawRun.tokens : [];
   let prevVector = null;
@@ -635,6 +641,82 @@ function parseRunContent(text, fileName = 'Imported') {
   return parsedRuns;
 }
 
+function normalizeBranchHistory(meta) {
+  const out = [];
+  const raw = meta?.branch_history;
+  if (Array.isArray(raw)) {
+    for (const item of raw) {
+      if (!item || typeof item !== 'object') continue;
+      const forkIndex = asNumber(item.fork_index);
+      if (!Number.isFinite(forkIndex)) continue;
+      out.push({
+        parent_run_id: item.parent_run_id ?? null,
+        fork_index: Math.max(0, Math.floor(forkIndex)),
+        alt_rank: asNumber(item.alt_rank),
+        from_token_id: item.from_token_id ?? null,
+        from_text: String(item.from_text ?? ''),
+        to_token_id: item.to_token_id ?? null,
+        to_text: String(item.to_text ?? ''),
+        logprob: asNumber(item.logprob),
+        prob: asNumber(item.prob),
+        timestamp: item.timestamp || null,
+      });
+    }
+  }
+
+  if (!out.length && meta?.branch && typeof meta.branch === 'object') {
+    const branch = meta.branch;
+    const forkIndex = asNumber(branch.fork_index);
+    if (Number.isFinite(forkIndex)) {
+      const chosen = (branch.chosen_alt_token && typeof branch.chosen_alt_token === 'object')
+        ? branch.chosen_alt_token
+        : {};
+      out.push({
+        parent_run_id: branch.parent_run_id ?? null,
+        fork_index: Math.max(0, Math.floor(forkIndex)),
+        alt_rank: asNumber(branch.alt_rank),
+        from_token_id: null,
+        from_text: '',
+        to_token_id: chosen.token_id ?? null,
+        to_text: String(chosen.token_text ?? ''),
+        logprob: asNumber(chosen.logprob),
+        prob: asNumber(chosen.prob),
+        timestamp: branch.timestamp || null,
+      });
+    }
+  }
+
+  return out;
+}
+
+function branchHistoryForRun(run) {
+  const history = run?.meta?.branch_history;
+  return Array.isArray(history) ? history : [];
+}
+
+function mutationIndexSet(run) {
+  const set = new Set();
+  for (const item of branchHistoryForRun(run)) {
+    const forkIndex = asNumber(item.fork_index);
+    if (!Number.isFinite(forkIndex)) continue;
+    set.add(Math.max(0, Math.floor(forkIndex)));
+  }
+  return set;
+}
+
+function compactToken(text, maxLen = 22) {
+  const shown = displayTokenText(String(text ?? ''));
+  if (shown.length <= maxLen) return shown;
+  return `${shown.slice(0, maxLen - 1)}…`;
+}
+
+function compactRunId(runId) {
+  const raw = String(runId ?? '');
+  if (!raw) return '-';
+  if (raw.length <= 16) return raw;
+  return `${raw.slice(0, 12)}…`;
+}
+
 function updateRunMeta() {
   const run = currentRunA();
   if (!run) {
@@ -644,9 +726,11 @@ function updateRunMeta() {
 
   const meta = run.meta || {};
   const settings = meta.generation_settings || {};
-  const branch = meta.branch;
-  const branchText = branch
-    ? ` | branch of ${branch.parent_run_id} @${branch.fork_index}`
+  const history = branchHistoryForRun(run);
+  const latest = history.length ? history[history.length - 1] : null;
+  const mutationText = history.length ? `mutations=${history.length}` : '';
+  const latestText = latest
+    ? `latest @${latest.fork_index}: ${compactToken(latest.from_text)} -> ${compactToken(latest.to_text)}`
     : '';
 
   ui.runMeta.textContent = [
@@ -655,7 +739,8 @@ function updateRunMeta() {
     `temp=${formatNum(asNumber(settings.temperature), 2)}`,
     `top_p=${formatNum(asNumber(settings.top_p), 2)}`,
     `seed=${settings.seed ?? '-'}`,
-    branchText,
+    mutationText,
+    latestText,
   ].filter(Boolean).join(' | ');
 }
 
@@ -679,6 +764,7 @@ function addOrUpdateRun(run, source = 'server') {
   syncTimelineBounds();
   updateRunMeta();
   renderBookmarks();
+  renderMutations();
   renderTokens(true);
   state.needsRender = true;
 }
@@ -811,6 +897,8 @@ function renderTokens(force = false) {
       ui.tokenStream.innerHTML = '';
       state.tokenNodes = [];
     }
+    state.mutationIndices = new Set();
+    state.latestMutationIndex = null;
     return;
   }
 
@@ -822,13 +910,20 @@ function renderTokens(force = false) {
   ui.tokenStream.innerHTML = '';
   state.tokenNodes = [];
 
-  const branchFork = run.meta?.branch?.fork_index;
+  const history = branchHistoryForRun(run);
+  const mutationIndices = mutationIndexSet(run);
+  const latestMutation = history.length ? asNumber(history[history.length - 1]?.fork_index) : null;
+  state.mutationIndices = mutationIndices;
+  state.latestMutationIndex = Number.isFinite(latestMutation) ? Math.floor(latestMutation) : null;
 
   for (const token of run.tokens) {
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.className = 'token-chip';
-    if (branchFork != null && token.index === branchFork) {
+    if (mutationIndices.has(token.index)) {
+      btn.classList.add('mutated');
+    }
+    if (state.latestMutationIndex != null && token.index === state.latestMutationIndex) {
       btn.classList.add('branch');
     }
     btn.dataset.index = String(token.index);
@@ -888,6 +983,81 @@ function renderBookmarks() {
 
     ui.bookmarkList.appendChild(row);
   }
+}
+
+function renderMutations() {
+  const run = currentRunA();
+  ui.mutationList.innerHTML = '';
+  ui.mutationCount.textContent = '0';
+  state.mutationIndices = new Set();
+  state.latestMutationIndex = null;
+
+  if (!run) return;
+
+  const history = branchHistoryForRun(run);
+  ui.mutationCount.textContent = String(history.length);
+  state.mutationIndices = mutationIndexSet(run);
+
+  if (!history.length) {
+    const empty = document.createElement('div');
+    empty.className = 'empty-list';
+    empty.textContent = 'No branch mutations on this run.';
+    ui.mutationList.appendChild(empty);
+    return;
+  }
+
+  const latest = history[history.length - 1];
+  state.latestMutationIndex = Math.max(0, Math.floor(asNumber(latest?.fork_index, 0)));
+
+  history.forEach((mutation, idx) => {
+    const forkIndex = Math.max(0, Math.floor(asNumber(mutation.fork_index, 0)));
+    const row = document.createElement('div');
+    row.className = 'mutation-item';
+
+    const head = document.createElement('div');
+    head.className = 'mutation-head';
+
+    const index = document.createElement('span');
+    index.className = 'mutation-index';
+    const rankText = Number.isFinite(asNumber(mutation.alt_rank)) ? ` • alt ${Math.floor(asNumber(mutation.alt_rank, 0)) + 1}` : '';
+    index.textContent = `M${idx + 1} @${forkIndex}${rankText}`;
+    head.appendChild(index);
+
+    const jump = document.createElement('button');
+    jump.type = 'button';
+    jump.textContent = 'Jump';
+    jump.addEventListener('click', () => setCurrentIndex(forkIndex));
+    head.appendChild(jump);
+    row.appendChild(head);
+
+    const change = document.createElement('div');
+    change.className = 'mutation-change';
+    const from = document.createElement('span');
+    from.className = 'mutation-token from';
+    from.textContent = compactToken(mutation.from_text || '(unknown)');
+    const arrow = document.createElement('span');
+    arrow.className = 'mutation-arrow';
+    arrow.textContent = '->';
+    const to = document.createElement('span');
+    to.className = 'mutation-token to';
+    to.textContent = compactToken(mutation.to_text || '(empty)');
+    change.appendChild(from);
+    change.appendChild(arrow);
+    change.appendChild(to);
+    row.appendChild(change);
+
+    const parent = document.createElement('div');
+    parent.className = 'mutation-parent';
+    parent.textContent = `from ${compactRunId(mutation.parent_run_id)}${mutation.timestamp ? ` • ${mutation.timestamp}` : ''}`;
+    row.appendChild(parent);
+
+    row.addEventListener('click', (event) => {
+      if (event.target instanceof HTMLButtonElement) return;
+      setCurrentIndex(forkIndex);
+    });
+
+    ui.mutationList.appendChild(row);
+  });
 }
 
 function addBookmark() {
@@ -1619,24 +1789,35 @@ async function createBranchFromPopup() {
   if (!token || !Array.isArray(token.topN) || !token.topN.length) return;
 
   const selectedRank = clamp(state.popup.selectedRank, 0, token.topN.length - 1);
+  const parentRunId = run.run_id;
+  const forkIndex = state.popup.tokenIndex;
 
   try {
     setStatus('Creating branch...', 'neutral');
     const response = await apiPost('/api/branch', {
-      run_id: run.run_id,
-      fork_index: state.popup.tokenIndex,
+      run_id: parentRunId,
+      fork_index: forkIndex,
       alt_rank: selectedRank,
-      label: `Branch@${state.popup.tokenIndex}`,
+      label: `Branch@${forkIndex}`,
     });
 
     const branchRunId = response.run_id;
     if (branchRunId) {
-      state.runAId = run.run_id;
-      state.runBId = branchRunId;
+      await refreshRunsFromServer();
+
+      state.runAId = branchRunId;
+      state.runBId = parentRunId;
       state.diffEnabled = true;
       ui.diffToggle.checked = true;
+
+      renderRunSelectors();
+      setCurrentIndex(forkIndex);
+      renderBookmarks();
+      renderMutations();
+      renderTokens(true);
+      state.needsRender = true;
+
       setStatus(`Branch started: ${branchRunId}`, 'success');
-      await refreshRunsFromServer();
     }
   } catch (err) {
     setStatus(`Branch failed: ${err.message}`, 'error');
@@ -1963,6 +2144,7 @@ function bindUI() {
     syncTimelineBounds();
     renderTokens(true);
     renderBookmarks();
+    renderMutations();
     closeTokenPopup();
     state.needsRender = true;
   });
