@@ -32,6 +32,8 @@ GEN_STOP = None
 GEN_RUN_ID = None
 
 DEFAULTS = {}
+BACKEND_PROBE_CACHE = {}
+BACKEND_PROBE_LOCK = threading.Lock()
 
 ALT_TOKEN_POOL = [
     " the",
@@ -808,6 +810,48 @@ def normalize_base_url(raw_value):
     return normalized
 
 
+def empty_backend_probe(base_url, probe_state="idle", probe_source=None):
+    return {
+        "base_url": base_url,
+        "reachable": False,
+        "completion": False,
+        "token_probs": False,
+        "embedding": False,
+        "strict_token_forcing": "unknown",
+        "model_required_explicit": "unknown",
+        "stop_semantics": "unknown",
+        "model": None,
+        "error": None,
+        "probe_state": probe_state,
+        "probe_source": probe_source,
+        "cached": False,
+        "probed_at": None,
+        "completion_ms": None,
+        "embedding_ms": None,
+        "probe_ms": None,
+    }
+
+
+def get_cached_backend_probe(base_url):
+    with BACKEND_PROBE_LOCK:
+        cached = copy.deepcopy(BACKEND_PROBE_CACHE.get(base_url))
+    if cached is None:
+        return None
+    cached["cached"] = True
+    return cached
+
+
+def store_backend_probe(base_url, info):
+    with BACKEND_PROBE_LOCK:
+        BACKEND_PROBE_CACHE[base_url] = copy.deepcopy(info)
+
+
+def publish_backend_probe(info):
+    payload = copy.deepcopy(info)
+    payload["cached"] = True
+    broadcast_event({"type": "backend_probe_updated", "backend": payload})
+
+
 def broadcast_event(event):
     payload = json.dumps(event, ensure_ascii=True).encode("utf-8")
     with CLIENTS_LOCK:
@@ -859,31 +903,97 @@ def fetch_model_name(base_url):
 
 
 def has_embedding_support(base_url):
+    started = time.monotonic()
     try:
         resp = http_post_json(build_url(base_url, "/embedding"), {"content": "probe"}, timeout=8)
     except Exception:
-        return False
+        return False, int((time.monotonic() - started) * 1000)
+    elapsed = int((time.monotonic() - started) * 1000)
     if isinstance(resp, dict):
         if isinstance(resp.get("embedding"), list):
-            return True
+            return True, elapsed
         data = resp.get("data")
         if isinstance(data, list) and data:
             first = data[0]
             if isinstance(first, dict) and isinstance(first.get("embedding"), list):
-                return True
-    return False
+                return True, elapsed
+    return False, elapsed
 
 
-def probe_backend(base_url):
-    info = {
-        "base_url": base_url,
-        "reachable": False,
-        "completion": False,
-        "token_probs": False,
-        "embedding": False,
-        "model": fetch_model_name(base_url),
-        "error": None,
+def infer_stop_semantics(response, stop_info):
+    if not isinstance(stop_info, dict):
+        return "unknown"
+    if stop_info.get("stopped_limit") and not stop_info.get("hard_stop"):
+        return "boundary-ambiguous"
+    if stop_info.get("hard_stop"):
+        return "hard"
+    resp = first_response(response)
+    if isinstance(resp, dict):
+        stop_flag = bool(resp.get("stop"))
+        tokens_predicted = sanitize_int(resp.get("tokens_predicted"), 0, minimum=0)
+        requested = sanitize_int(
+            (resp.get("generation_settings") or {}).get("n_predict"),
+            sanitize_int(resp.get("generation_settings", {}).get("max_tokens"), 0, minimum=0) if isinstance(resp.get("generation_settings"), dict) else 0,
+            minimum=0,
+        )
+        if stop_flag and not stop_info.get("hard_stop") and requested > 0 and tokens_predicted >= requested:
+            return "boundary-ambiguous"
+    return "unknown"
+
+
+def try_strict_token_forcing_probe(base_url, model_name, base_payload, response):
+    probs = extract_probs(response)
+    if not isinstance(probs, list) or not probs:
+        return "unknown"
+    first = probs[0]
+    if not isinstance(first, dict):
+        return "unknown"
+
+    probe_token = token_record_from_entry(first, 5, "probe_backend", 0, 0)
+    topn = probe_token.get("topN") or []
+    chosen_id = probe_token.get("chosen_token_id")
+    alt = None
+    for item in topn:
+        token_id = item.get("token_id")
+        if token_id is None:
+            continue
+        if chosen_id is not None and token_id == chosen_id:
+            continue
+        alt = item
+        break
+    if alt is None or chosen_id is None:
+        return "unknown"
+
+    payload = copy.deepcopy(base_payload)
+    if model_name:
+        payload["model"] = model_name
+    payload["logit_bias"] = {
+        str(alt.get("token_id")): 50.0,
+        str(chosen_id): -50.0,
     }
+
+    try:
+        forced = http_post_json(build_url(base_url, "/completion"), payload, timeout=12)
+    except Exception as err:
+        msg = str(err).lower()
+        if "logit_bias" in msg or "unknown field" in msg or "unknown parameter" in msg or "invalid type" in msg:
+            return "no"
+        return "unknown"
+
+    forced_probs = extract_probs(forced)
+    if isinstance(forced_probs, list) and forced_probs:
+        forced_first = forced_probs[0]
+        if isinstance(forced_first, dict):
+            forced_token = token_record_from_entry(forced_first, 5, "probe_backend_forced", 0, 0)
+            if forced_token.get("chosen_token_id") == alt.get("token_id"):
+                return "maybe"
+    return "unknown"
+
+
+def probe_backend_uncached(base_url, probe_source="manual"):
+    started = time.monotonic()
+    info = empty_backend_probe(base_url, probe_state="ready", probe_source=probe_source)
+    info["model"] = fetch_model_name(base_url)
 
     payload = {
         "prompt": "Probe:",
@@ -897,25 +1007,85 @@ def probe_backend(base_url):
         "seed": 0,
         "id_slot": DEFAULTS.get("id_slot", 0),
     }
-    if info["model"]:
-        payload["model"] = info["model"]
 
+    response = None
+    completion_started = time.monotonic()
     try:
-        resp = http_post_json(build_url(base_url, "/completion"), payload, timeout=12)
-        info["reachable"] = True
+        response = http_post_json(build_url(base_url, "/completion"), payload, timeout=12)
         info["completion"] = True
-        info["token_probs"] = bool(extract_probs(resp))
+        info["reachable"] = True
+        info["model_required_explicit"] = "no"
     except Exception as err:
-        info["error"] = str(err)
+        msg = str(err)
+        if "model name is missing" in msg.lower():
+            info["model_required_explicit"] = "yes"
+            retry_payload = copy.deepcopy(payload)
+            if info["model"]:
+                retry_payload["model"] = info["model"]
+                try:
+                    response = http_post_json(build_url(base_url, "/completion"), retry_payload, timeout=12)
+                    info["completion"] = True
+                    info["reachable"] = True
+                except Exception as retry_err:
+                    info["error"] = str(retry_err)
+            else:
+                info["error"] = msg
+        else:
+            info["error"] = msg
+    info["completion_ms"] = int((time.monotonic() - completion_started) * 1000)
+
+    if response is not None:
+        info["token_probs"] = bool(extract_probs(response))
+        info["stop_semantics"] = infer_stop_semantics(response, extract_stop_info(response))
+        info["strict_token_forcing"] = try_strict_token_forcing_probe(base_url, info["model"], payload, response)
 
     try:
-        info["embedding"] = has_embedding_support(base_url)
+        info["embedding"], info["embedding_ms"] = has_embedding_support(base_url)
         if info["embedding"]:
             info["reachable"] = True
     except Exception:
-        pass
+        info["embedding"] = False
 
+    info["probe_ms"] = int((time.monotonic() - started) * 1000)
+    info["probed_at"] = utc_now_iso()
     return info
+
+
+def probe_backend(base_url, refresh=False, probe_source="manual"):
+    cached = None if refresh else get_cached_backend_probe(base_url)
+    if cached is not None and cached.get("probe_state") in ("warming", "ready"):
+        return cached
+
+    info = probe_backend_uncached(base_url, probe_source=probe_source)
+    store_backend_probe(base_url, info)
+    publish_backend_probe(info)
+    return copy.deepcopy(info)
+
+
+def start_backend_warmup(base_url):
+    if not base_url:
+        return
+    cached = get_cached_backend_probe(base_url)
+    if cached is not None and cached.get("probe_state") in ("warming", "ready"):
+        return
+
+    warming = empty_backend_probe(base_url, probe_state="warming", probe_source="startup")
+    warming["probed_at"] = utc_now_iso()
+    store_backend_probe(base_url, warming)
+    publish_backend_probe(warming)
+
+    def worker():
+        try:
+            info = probe_backend_uncached(base_url, probe_source="startup")
+        except Exception as err:
+            info = empty_backend_probe(base_url, probe_state="ready", probe_source="startup")
+            info["error"] = str(err)
+            info["probed_at"] = utc_now_iso()
+        store_backend_probe(base_url, info)
+        publish_backend_probe(info)
+
+    thread = threading.Thread(target=worker, name="backend-warmup", daemon=True)
+    thread.start()
 
 
 def sanitize_settings(raw_settings):
@@ -1962,6 +2132,9 @@ class TelemetryHandler(SimpleHTTPRequestHandler):
             with GEN_LOCK:
                 running = bool(GEN_THREAD and GEN_THREAD.is_alive())
                 active_run_id = GEN_RUN_ID
+            backend_probe = get_cached_backend_probe(DEFAULTS.get("base_url"))
+            if backend_probe is None:
+                backend_probe = empty_backend_probe(DEFAULTS.get("base_url"), probe_state="idle")
             send_json(
                 self,
                 200,
@@ -1969,6 +2142,7 @@ class TelemetryHandler(SimpleHTTPRequestHandler):
                     "running": running,
                     "active_run_id": active_run_id,
                     "defaults": copy.deepcopy(DEFAULTS),
+                    "backend_probe": backend_probe,
                 },
             )
             return
@@ -2005,12 +2179,13 @@ class TelemetryHandler(SimpleHTTPRequestHandler):
 
         if path == "/api/backend-info":
             raw_base_url = body.get("base_url") or DEFAULTS["base_url"]
+            refresh = bool(body.get("refresh"))
             try:
                 base_url = normalize_base_url(raw_base_url)
             except ValueError:
                 send_json(self, 400, {"error": "base_url is invalid"})
                 return
-            send_json(self, 200, {"backend": probe_backend(base_url)})
+            send_json(self, 200, {"backend": probe_backend(base_url, refresh=refresh, probe_source="manual")})
             return
 
         if path == "/api/live-experiment":
@@ -2137,7 +2312,7 @@ def main():
 
     DEFAULTS.update(
         {
-            "base_url": args.default_base_url,
+            "base_url": normalize_base_url(args.default_base_url),
             "max_tokens": max(1, args.default_max_tokens),
             "chunk_size": max(1, args.default_chunk_size),
             "top_n": max(1, args.default_topn),
@@ -2154,6 +2329,7 @@ def main():
 
     handler = lambda *h_args, **h_kwargs: TelemetryHandler(*h_args, directory=static_dir, **h_kwargs)
     server = ThreadingHTTPServer((args.host, args.port), handler)
+    start_backend_warmup(DEFAULTS["base_url"])
 
     sys.stderr.write(f"Serving on http://{args.host}:{args.port}\n")
     sys.stderr.write("SSE stream: /stream\n")

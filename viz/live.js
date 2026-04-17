@@ -38,6 +38,9 @@ const ui = {
   backendModel: document.getElementById('backend-model'),
   backendProbs: document.getElementById('backend-probs'),
   backendEmbeddings: document.getElementById('backend-embeddings'),
+  backendModelRequired: document.getElementById('backend-model-required'),
+  backendStopSemantics: document.getElementById('backend-stop-semantics'),
+  backendTokenForcing: document.getElementById('backend-token-forcing'),
   backendMode: document.getElementById('backend-mode'),
 
   interventionCount: document.getElementById('intervention-count'),
@@ -65,6 +68,12 @@ function formatNum(value, digits = 3) {
 function formatPercent(value, digits = 0) {
   if (value == null || !Number.isFinite(value)) return '-';
   return `${(Number(value) * 100).toFixed(digits)}%`;
+}
+
+function capabilityText(value, fallback = 'unknown') {
+  const raw = String(value ?? '').trim();
+  if (!raw) return fallback;
+  return raw.replace(/_/g, ' ');
 }
 
 function normalizeBaseUrl(rawValue) {
@@ -294,7 +303,30 @@ function renderBackend() {
   ui.backendModel.textContent = info?.model || '-';
   ui.backendProbs.textContent = info ? (info.token_probs ? 'yes' : info.completion ? 'no / weak' : '-') : '-';
   ui.backendEmbeddings.textContent = info ? (info.embedding ? 'yes' : 'no') : '-';
+  ui.backendModelRequired.textContent = info ? capabilityText(info.model_required_explicit) : '-';
+  ui.backendStopSemantics.textContent = info ? capabilityText(info.stop_semantics) : '-';
+  ui.backendTokenForcing.textContent = info ? capabilityText(info.strict_token_forcing) : '-';
   ui.backendMode.textContent = 'prefix_replay';
+}
+
+function applyBackendInfo(info, { updateStatus = true } = {}) {
+  state.backendInfo = info || null;
+  renderBackend();
+  if (!updateStatus || !info) return;
+  const baseUrl = normalizeBaseUrl(ui.endpoint.value) || info.base_url || '';
+  if (info.probe_state === 'warming') {
+    setStatus(`Backend warming: ${info.model || baseUrl || 'default backend'}`, 'neutral');
+    return;
+  }
+  if (info.reachable) {
+    setStatus(`${info.cached ? 'Backend warmed' : 'Backend ready'}: ${info.model || baseUrl}`, 'success');
+    return;
+  }
+  if (info.error) {
+    setStatus(`Backend probe failed: ${info.error}`, 'error');
+    return;
+  }
+  setStatus('Backend probe unavailable.', 'neutral');
 }
 
 function renderInterventions(result) {
@@ -391,6 +423,15 @@ function connectStream() {
       return;
     }
     if (!payload?.type) return;
+
+    if (payload.type === 'backend_probe_updated' && payload.backend) {
+      const endpoint = normalizeBaseUrl(ui.endpoint.value);
+      if (!endpoint || payload.backend.base_url === endpoint) {
+        applyBackendInfo(payload.backend, { updateStatus: false });
+      }
+      return;
+    }
+
     if (!payload.experiment_id || payload.experiment_id !== state.currentExperimentId) return;
 
     if (payload.type === 'live_experiment_started') {
@@ -484,10 +525,8 @@ async function probeBackend() {
   ui.endpoint.value = baseUrl;
   try {
     setStatus('Probing backend...', 'neutral');
-    const response = await apiPost('/api/backend-info', { base_url: baseUrl });
-    state.backendInfo = response?.backend || null;
-    renderBackend();
-    setStatus(state.backendInfo?.reachable ? `Backend ready: ${state.backendInfo.model || baseUrl}` : 'Backend probe failed.', state.backendInfo?.reachable ? 'success' : 'error');
+    const response = await apiPost('/api/backend-info', { base_url: baseUrl, refresh: true });
+    applyBackendInfo(response?.backend || null);
   } catch (err) {
     setStatus(`Probe failed: ${err.message}`, 'error');
   }
@@ -559,7 +598,12 @@ async function bootstrap() {
   window.addEventListener('resize', hideTokenTooltip);
 
   connectStream();
-  await probeBackend().catch(() => null);
+  if (status?.backend_probe?.base_url) {
+    applyBackendInfo(status.backend_probe);
+  }
+  if (!status?.backend_probe?.base_url || status?.backend_probe?.probe_state === 'idle') {
+    await probeBackend().catch(() => null);
+  }
 }
 
 bootstrap();
