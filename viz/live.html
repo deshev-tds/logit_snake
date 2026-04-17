@@ -97,15 +97,17 @@
             <div class="kv"><span>Max Risk</span><strong id="baseline-risk">-</strong></div>
             <div class="kv"><span>Alerts</span><strong id="baseline-alerts">-</strong></div>
             <div class="kv"><span>Tokens</span><strong id="baseline-tokens">-</strong></div>
+            <div class="token-note">Hover tokens for telemetry. Peak-risk token is highlighted in red.</div>
             <div id="baseline-text" class="text-block">-</div>
           </section>
 
           <section class="subpanel">
-            <h3>Corrected</h3>
+            <h3 id="corrected-title">Corrected</h3>
             <div class="kv"><span>Run ID</span><strong id="corrected-run-id">-</strong></div>
             <div class="kv"><span>Max Risk</span><strong id="corrected-risk">-</strong></div>
             <div class="kv"><span>Alerts</span><strong id="corrected-alerts">-</strong></div>
             <div class="kv"><span>Tokens</span><strong id="corrected-tokens">-</strong></div>
+            <div class="token-note">Hover tokens for telemetry. Peak-risk token is highlighted in red.</div>
             <div id="corrected-text" class="text-block">-</div>
           </section>
         </section>
@@ -137,6 +139,8 @@
       </aside>
     </main>
   </div>
+
+  <div id="live-token-tooltip" aria-hidden="true"></div>
 
   <script type="module" src="live.js"></script>
 </body>

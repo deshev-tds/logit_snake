@@ -36,6 +36,7 @@ const ui = {
   diffAlignment: document.getElementById('diff-alignment'),
 
   storyRisk: document.getElementById('story-risk'),
+  storyRunRisk: document.getElementById('story-run-risk'),
   storyReasons: document.getElementById('story-reasons'),
   storyMeaning: document.getElementById('story-meaning'),
 
@@ -953,6 +954,7 @@ function renderAudienceSummary() {
   const token = run?.tokens?.[state.currentIndex];
   if (!run || !token) {
     ui.storyRisk.textContent = '-';
+    ui.storyRunRisk.textContent = '-';
     ui.storyReasons.textContent = '-';
     ui.storyMeaning.textContent = 'Load or generate a run to get a plain-language explanation.';
     return;
@@ -961,8 +963,37 @@ function renderAudienceSummary() {
   const risk = explainRisk(token);
   const reasons = reasonLabels(token);
   ui.storyRisk.textContent = `${risk.label} (${formatPercent(token.decoder_risk, 0)})`;
+  ui.storyRunRisk.textContent = formatPercent(maxRiskValueForRun(run), 0);
   ui.storyReasons.textContent = reasons.length ? reasons.join(', ') : 'no strong decoder-side warning signs';
   ui.storyMeaning.textContent = risk.meaning;
+}
+
+function maxRiskValueForRun(run) {
+  const summaryValue = asNumber(run?.summary?.decoder_risk_max);
+  if (summaryValue != null) return summaryValue;
+  const tokens = Array.isArray(run?.tokens) ? run.tokens : [];
+  let best = null;
+  for (const token of tokens) {
+    const risk = asNumber(token?.decoder_risk);
+    if (risk == null) continue;
+    if (best == null || risk > best) best = risk;
+  }
+  return best;
+}
+
+function maxRiskIndexForRun(run) {
+  const tokens = Array.isArray(run?.tokens) ? run.tokens : [];
+  let bestIndex = 0;
+  let bestRisk = null;
+  for (let i = 0; i < tokens.length; i += 1) {
+    const risk = asNumber(tokens[i]?.decoder_risk);
+    if (risk == null) continue;
+    if (bestRisk == null || risk > bestRisk) {
+      bestRisk = risk;
+      bestIndex = i;
+    }
+  }
+  return bestIndex;
 }
 
 function renderBackendPanel() {
@@ -2408,6 +2439,8 @@ function applyUrlSelection() {
   const runA = params.get('runA');
   const runB = params.get('runB');
   const diff = params.get('diff');
+  const indexParam = params.get('index');
+  const focus = params.get('focus');
 
   let changed = false;
   if (runA && state.runs.has(runA)) {
@@ -2420,6 +2453,14 @@ function applyUrlSelection() {
   }
   if (diff != null) {
     state.diffEnabled = diff === '1' || diff === 'true';
+    changed = true;
+  }
+  if (focus === 'max-risk') {
+    const run = runA && state.runs.has(runA) ? state.runs.get(runA) : currentRunA();
+    state.currentIndex = clamp(maxRiskIndexForRun(run), 0, Math.max(0, (run?.tokens?.length || 1) - 1));
+    changed = true;
+  } else if (indexParam != null) {
+    state.currentIndex = asNumber(indexParam, state.currentIndex) ?? state.currentIndex;
     changed = true;
   }
 

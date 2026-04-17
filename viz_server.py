@@ -1877,6 +1877,11 @@ def run_live_correction_experiment(prompt, base_url, settings, policy, experimen
             break
 
     finalize_completed_run(corrected, started, status="complete")
+    corrected.setdefault("meta", {}).setdefault("live_experiment", {})
+    corrected["meta"]["live_experiment"]["had_intervention"] = bool(interventions)
+    corrected["meta"]["live_experiment"]["comparison_role"] = "corrected" if interventions else "replay_sample"
+    if not interventions:
+        corrected["meta"]["label"] = "Replay"
     corrected.setdefault("analysis", {})["interventions"] = copy.deepcopy(interventions)
 
     with RUNS_LOCK:

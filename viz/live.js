@@ -26,11 +26,13 @@ const ui = {
   baselineTokens: document.getElementById('baseline-tokens'),
   baselineText: document.getElementById('baseline-text'),
 
+  correctedTitle: document.getElementById('corrected-title'),
   correctedRunId: document.getElementById('corrected-run-id'),
   correctedRisk: document.getElementById('corrected-risk'),
   correctedAlerts: document.getElementById('corrected-alerts'),
   correctedTokens: document.getElementById('corrected-tokens'),
   correctedText: document.getElementById('corrected-text'),
+  tokenTooltip: document.getElementById('live-token-tooltip'),
 
   backendReachable: document.getElementById('backend-reachable'),
   backendModel: document.getElementById('backend-model'),
@@ -47,6 +49,7 @@ const state = {
   lastResult: null,
   currentExperimentId: null,
   partialInterventions: [],
+  hoverToken: null,
 };
 
 function asNumber(value, fallback = null) {
@@ -129,6 +132,25 @@ function textFromRun(run) {
   return tokens.map((token) => token?.text || '').join('') || '-';
 }
 
+function tokenRiskValue(token) {
+  return asNumber(token?.decoder_risk);
+}
+
+function peakRiskIndex(run) {
+  const tokens = Array.isArray(run?.tokens) ? run.tokens : [];
+  let bestIndex = -1;
+  let bestRisk = null;
+  for (let i = 0; i < tokens.length; i += 1) {
+    const risk = tokenRiskValue(tokens[i]);
+    if (risk == null) continue;
+    if (bestRisk == null || risk > bestRisk) {
+      bestRisk = risk;
+      bestIndex = i;
+    }
+  }
+  return bestIndex;
+}
+
 function displayTokenText(text) {
   const raw = String(text ?? '');
   if (!raw) return '[empty]';
@@ -136,6 +158,134 @@ function displayTokenText(text) {
     .replace(/ /g, '␠')
     .replace(/\n/g, '↵')
     .replace(/\t/g, '⇥');
+}
+
+function scalarTelemetry(token) {
+  return [
+    ['Index', token?.index],
+    ['Token', displayTokenText(token?.text)],
+    ['Token ID', token?.chosen_token_id ?? '-'],
+    ['Time', token?.t != null ? `${token.t} ms` : '-'],
+    ['Prob', formatPercent(token?.prob, 2)],
+    ['Logprob', formatNum(token?.logprob, 3)],
+    ['Entropy', formatNum(token?.entropy, 3)],
+    ['Margin', formatNum(token?.margin, 3)],
+    ['Uncertainty', formatPercent(token?.uncertainty, 1)],
+    ['Choice Gap', formatPercent(token?.prob_gap, 1)],
+    ['Jump', formatPercent(token?.entropy_delta, 1)],
+    ['Repeat', formatPercent(token?.repetition_pressure, 1)],
+    ['Risk', formatPercent(token?.decoder_risk, 1)],
+    ['Velocity', formatNum(token?.velocity, 3)],
+    ['Curvature', formatNum(token?.curvature, 3)],
+  ];
+}
+
+function ensureTooltipPosition(clientX, clientY) {
+  const tooltip = ui.tokenTooltip;
+  const pad = 14;
+  const rect = tooltip.getBoundingClientRect();
+  let left = clientX + 18;
+  let top = clientY + 18;
+  if (left + rect.width + pad > window.innerWidth) {
+    left = clientX - rect.width - 18;
+  }
+  if (top + rect.height + pad > window.innerHeight) {
+    top = clientY - rect.height - 18;
+  }
+  tooltip.style.left = `${Math.max(pad, left)}px`;
+  tooltip.style.top = `${Math.max(pad, top)}px`;
+}
+
+function hideTokenTooltip() {
+  ui.tokenTooltip.classList.remove('visible');
+  ui.tokenTooltip.setAttribute('aria-hidden', 'true');
+  state.hoverToken = null;
+}
+
+function showTokenTooltip(token, event) {
+  if (!token) return;
+  state.hoverToken = token;
+  const tooltip = ui.tokenTooltip;
+  tooltip.innerHTML = '';
+
+  const head = document.createElement('div');
+  head.className = 'live-tooltip-head';
+  const title = document.createElement('strong');
+  title.textContent = `Token #${token.index ?? '-'}`;
+  const text = document.createElement('span');
+  text.textContent = displayTokenText(token.text);
+  head.appendChild(title);
+  head.appendChild(text);
+  tooltip.appendChild(head);
+
+  const grid = document.createElement('div');
+  grid.className = 'live-tooltip-grid';
+  for (const [label, value] of scalarTelemetry(token)) {
+    const item = document.createElement('div');
+    item.className = 'live-tooltip-item';
+    const key = document.createElement('span');
+    key.textContent = label;
+    const val = document.createElement('strong');
+    val.textContent = String(value ?? '-');
+    item.appendChild(key);
+    item.appendChild(val);
+    grid.appendChild(item);
+  }
+  tooltip.appendChild(grid);
+
+  const topn = Array.isArray(token?.topN) ? token.topN : [];
+  if (topn.length) {
+    const section = document.createElement('div');
+    section.className = 'live-tooltip-topn';
+    const heading = document.createElement('div');
+    heading.className = 'live-tooltip-subhead';
+    heading.textContent = 'Top Alternatives';
+    section.appendChild(heading);
+    topn.slice(0, 5).forEach((item, idx) => {
+      const row = document.createElement('div');
+      row.className = 'live-tooltip-alt';
+      row.textContent = `#${idx + 1} ${displayTokenText(item?.token_text)} | p ${formatPercent(item?.prob, 1)} | lp ${formatNum(item?.logprob, 3)}`;
+      section.appendChild(row);
+    });
+    tooltip.appendChild(section);
+  }
+
+  tooltip.classList.add('visible');
+  tooltip.setAttribute('aria-hidden', 'false');
+  ensureTooltipPosition(event.clientX, event.clientY);
+}
+
+function moveTokenTooltip(event) {
+  if (!state.hoverToken || !ui.tokenTooltip.classList.contains('visible')) return;
+  ensureTooltipPosition(event.clientX, event.clientY);
+}
+
+function renderRunTokens(container, run, fallbackText = '-') {
+  const tokens = Array.isArray(run?.tokens) ? run.tokens : [];
+  if (!tokens.length) {
+    container.textContent = fallbackText;
+    container.classList.remove('tokenized-output');
+    return;
+  }
+
+  container.innerHTML = '';
+  container.classList.add('tokenized-output');
+  const peakIndex = peakRiskIndex(run);
+
+  tokens.forEach((token, idx) => {
+    const span = document.createElement('span');
+    span.className = 'live-token';
+    const risk = tokenRiskValue(token);
+    if (risk != null) span.classList.add('has-telemetry');
+    if (idx === peakIndex) span.classList.add('peak-risk');
+    if (risk != null && risk >= 0.64) span.classList.add('alert-risk');
+    span.textContent = token?.text || '';
+    span.dataset.index = String(token?.index ?? idx);
+    span.addEventListener('mouseenter', (event) => showTokenTooltip(token, event));
+    span.addEventListener('mousemove', moveTokenTooltip);
+    span.addEventListener('mouseleave', hideTokenTooltip);
+    container.appendChild(span);
+  });
 }
 
 function renderBackend() {
@@ -191,17 +341,20 @@ function renderInterventions(result) {
 function resetExperimentView() {
   state.lastResult = null;
   state.partialInterventions = [];
+  hideTokenTooltip();
   ui.experimentMeta.textContent = 'Experiment is running...';
   ui.experimentSummary.textContent = 'Waiting for the first token-level updates from the live experiment loop.';
   ui.baselineRunId.textContent = '-';
   ui.baselineRisk.textContent = '-';
   ui.baselineAlerts.textContent = '-';
   ui.baselineTokens.textContent = '-';
+  ui.baselineText.classList.remove('tokenized-output');
   ui.baselineText.textContent = '-';
   ui.correctedRunId.textContent = '-';
   ui.correctedRisk.textContent = '-';
   ui.correctedAlerts.textContent = '-';
   ui.correctedTokens.textContent = '-';
+  ui.correctedText.classList.remove('tokenized-output');
   ui.correctedText.textContent = '-';
   ui.interventionCount.textContent = '0';
   ui.interventionList.innerHTML = '<div class=\"empty-list\">No intervention has been triggered yet.</div>';
@@ -279,29 +432,44 @@ function renderResult(result) {
   state.lastResult = result;
   const baseline = result?.baseline;
   const corrected = result?.corrected;
+  const interventionCount = Number(result?.metrics?.intervention_count ?? 0);
+  const correctedLabel = interventionCount > 0 ? 'Corrected' : 'Replay Sample';
+  ui.correctedTitle.textContent = correctedLabel;
 
   ui.experimentMeta.textContent = `Mode=${result?.mode || '-'} | interventions=${result?.metrics?.intervention_count ?? 0} | baseline=${result?.baseline_run_id || '-'} | corrected=${result?.corrected_run_id || '-'}`;
-  ui.experimentSummary.textContent =
-    `Baseline max risk ${formatPercent(result?.metrics?.baseline_max_risk, 0)} vs corrected ${formatPercent(result?.metrics?.corrected_max_risk, 0)}. `
-    + `Alerts: ${result?.metrics?.baseline_alerts ?? '-'} -> ${result?.metrics?.corrected_alerts ?? '-'}. `
-    + `Use "Open In Snake Scope" to inspect both trajectories in the main visualizer.`;
+  if (interventionCount > 0) {
+    ui.experimentSummary.textContent =
+      `Baseline max risk ${formatPercent(result?.metrics?.baseline_max_risk, 0)} vs corrected ${formatPercent(result?.metrics?.corrected_max_risk, 0)}. `
+      + `Alerts: ${result?.metrics?.baseline_alerts ?? '-'} -> ${result?.metrics?.corrected_alerts ?? '-'}. `
+      + `Use "Open In Snake Scope" to inspect both trajectories in the main visualizer.`;
+  } else {
+    ui.experimentSummary.textContent =
+      `No intervention fired. Baseline max risk ${formatPercent(result?.metrics?.baseline_max_risk, 0)} and replay max risk ${formatPercent(result?.metrics?.corrected_max_risk, 0)} are two matched decode samples, not evidence that a correction policy helped or hurt. `
+      + `Use "Open In Snake Scope" to inspect both trajectories in the main visualizer.`;
+  }
 
   ui.baselineRunId.textContent = baseline?.run_id || '-';
   ui.baselineRisk.textContent = formatPercent(baseline?.summary?.decoder_risk_max, 0);
   ui.baselineAlerts.textContent = String(baseline?.summary?.decoder_alert_count ?? '-');
   ui.baselineTokens.textContent = String(baseline?.summary?.token_count ?? '-');
-  ui.baselineText.textContent = textFromRun(baseline);
+  renderRunTokens(ui.baselineText, baseline, '-');
 
   ui.correctedRunId.textContent = corrected?.run_id || '-';
   ui.correctedRisk.textContent = formatPercent(corrected?.summary?.decoder_risk_max, 0);
   ui.correctedAlerts.textContent = String(corrected?.summary?.decoder_alert_count ?? '-');
   ui.correctedTokens.textContent = String(corrected?.summary?.token_count ?? '-');
-  ui.correctedText.textContent = textFromRun(corrected);
+  renderRunTokens(ui.correctedText, corrected, '-');
 
   const link = new URL('./', window.location.href);
-  if (baseline?.run_id) link.searchParams.set('runA', corrected?.run_id || baseline.run_id);
-  if (corrected?.run_id) link.searchParams.set('runB', baseline?.run_id || corrected.run_id);
+  if (interventionCount > 0) {
+    if (baseline?.run_id) link.searchParams.set('runA', corrected?.run_id || baseline.run_id);
+    if (corrected?.run_id) link.searchParams.set('runB', baseline?.run_id || corrected.run_id);
+  } else {
+    if (baseline?.run_id) link.searchParams.set('runA', baseline.run_id);
+    if (corrected?.run_id) link.searchParams.set('runB', corrected.run_id);
+  }
   link.searchParams.set('diff', '1');
+  link.searchParams.set('focus', 'max-risk');
   ui.openMainLink.href = link.toString();
 
   renderInterventions(result);
@@ -387,6 +555,8 @@ async function bootstrap() {
     const normalized = normalizeBaseUrl(ui.endpoint.value);
     if (normalized) ui.endpoint.value = normalized;
   });
+  window.addEventListener('scroll', hideTokenTooltip, true);
+  window.addEventListener('resize', hideTokenTooltip);
 
   connectStream();
   await probeBackend().catch(() => null);

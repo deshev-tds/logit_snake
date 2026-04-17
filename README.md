@@ -66,6 +66,10 @@ The current repo now includes the decoder-diagnostics rewrite described above.
 - Saved the next project backlog in [docs/NEXT_STEPS.md](docs/NEXT_STEPS.md).
 - Added a separate `Live Branch Lab` page that runs baseline vs corrected decode and links the resulting runs back into the main visualizer.
 - Added live-ish incremental updates for `Live Branch Lab` via SSE so the page shows baseline/corrected progress before the final response returns.
+- Clarified the no-intervention case in `Live Branch Lab`: when no branch is accepted, the second run is labeled as a replay sample rather than being presented as a successful correction.
+- Updated handoff into `Snake Scope` so it opens on the max-risk token and distinguishes `Current Token Risk` from `Run Max Risk`.
+- Replaced the Lab's plain text output blocks with readable inline token rendering, peak-risk token highlighting, and per-token hover telemetry.
+- Pruned [docs/NEXT_STEPS.md](docs/NEXT_STEPS.md) so it contains only active lab work and no non-research backlog filler.
 - Measured the current latency envelope on a fixed `max_tokens=18` / single-intervention benchmark:
   - backend mean completion time: about `4.08s` before SSE vs `4.12s` after SSE
   - first visible UI update: about `4.07s` before SSE vs `0.08s` after SSE
@@ -94,10 +98,12 @@ What it does:
 - watches decoder-risk token-by-token
 - when the risk stays high long enough, it replays from an earlier prefix and evaluates a few alternative next-token branches
 - chooses a lower-risk branch only if the measured reduction is large enough
+- renders the generated text as inline tokens, highlights the peak-risk token, and exposes token telemetry on hover
 
 Current limitation:
 - this is a `prefix_replay` intervention, not exact KV-state rollback
 - lower decoder risk after branching is useful evidence, but it is not proof of factual correctness
+- if no intervention fires, the second run should be read as a matched replay sample rather than as evidence of successful correction
 
 The repeatable evaluation plan for this page lives in [docs/LIVE_BRANCH_EVAL.md](docs/LIVE_BRANCH_EVAL.md).
 
