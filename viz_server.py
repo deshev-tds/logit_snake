@@ -1065,6 +1065,166 @@ def initialize_prefill_tokens(run):
     run["meta"]["providers"]["embedding"] = provider.mode
 
 
+def finalize_completed_run(run, started, status="complete"):
+    recompute_kinematics(run["tokens"])
+    enrich_decoder_diagnostics(run["tokens"])
+    run["analysis"]["regime_markers"] = detect_regime_markers(run["tokens"])
+    run["analysis"]["decoder_alerts"] = detect_decoder_alerts(run["tokens"])
+    run["meta"]["status"] = status
+    run["meta"]["completed_at"] = utc_now_iso()
+
+    entropies = [t.get("entropy") for t in run["tokens"] if t.get("entropy") is not None]
+    velocities = [t.get("velocity") for t in run["tokens"] if t.get("velocity") is not None]
+    risks = [t.get("decoder_risk") for t in run["tokens"] if t.get("decoder_risk") is not None]
+    run["summary"] = {
+        "token_count": len(run["tokens"]),
+        "entropy_avg": (sum(entropies) / len(entropies)) if entropies else None,
+        "velocity_max": max(velocities) if velocities else None,
+        "decoder_risk_max": max(risks) if risks else None,
+        "decoder_alert_count": len(run["analysis"]["decoder_alerts"]),
+        "duration_ms": int((time.monotonic() - started) * 1000),
+    }
+
+
+def completion_with_model_retry(base_url, prompt, chunk_size, settings, model_name):
+    try:
+        return generate_completion_chunk(
+            base_url,
+            prompt,
+            chunk_size,
+            settings,
+            model_name=model_name,
+        ), model_name
+    except Exception as req_err:
+        req_msg = str(req_err)
+        if "model name is missing" in req_msg.lower():
+            refreshed_model = fetch_model_name(base_url)
+            if refreshed_model:
+                return generate_completion_chunk(
+                    base_url,
+                    prompt,
+                    chunk_size,
+                    settings,
+                    model_name=refreshed_model,
+                ), refreshed_model
+        raise
+
+
+def generate_single_token_step(base_url, prompt, settings, model_name, prompt_hash, token_index, history_text, vector_provider, started):
+    response, model_name = completion_with_model_retry(base_url, prompt, 1, settings, model_name)
+    content = extract_content(response)
+    probs = extract_probs(response)
+    stop_info = extract_stop_info(response)
+    t_ms = int((time.monotonic() - started) * 1000)
+
+    token = None
+    if isinstance(probs, list) and probs:
+        entry = probs[0]
+        if isinstance(entry, dict):
+            token = token_record_from_entry(entry, settings.get("top_n", DEFAULTS["top_n"]), prompt_hash, token_index, t_ms)
+    if token is None:
+        fallback_tokens = tokenize_fallback(content)
+        if fallback_tokens:
+            token = token_record_fallback(
+                fallback_tokens[0],
+                settings.get("top_n", DEFAULTS["top_n"]),
+                prompt_hash,
+                token_index,
+                t_ms,
+            )
+
+    if token is not None:
+        token_text = token.get("text", "")
+        token["embedding"] = vector_provider.vector_for(token_index, token.get("chosen_token_id"), token_text, history_text)
+    return token, stop_info, model_name
+
+
+def add_token_local(run, token):
+    run["tokens"].append(token)
+    run["meta"]["providers"]["topN"] = token.get("topn_provider", run["meta"]["providers"].get("topN"))
+    run["meta"]["providers"]["embedding"] = run["meta"]["providers"].get("embedding")
+
+
+def decode_run_local(run, max_new_tokens=None):
+    started = time.monotonic()
+    initialize_prefill_tokens(run)
+
+    meta = run["meta"]
+    settings = meta["generation_settings"]
+    prompt_hash = meta["prompt_hash"]
+    base_url = meta["base_url"]
+    inference_prompt = meta.get("inference_prompt") or meta.get("prompt", "")
+    model_name = meta.get("model")
+
+    vector_provider = VectorProvider(
+        settings.get("vector_mode", "placeholder"),
+        base_url,
+        settings.get("vector_dim", DEFAULTS["vector_dim"]),
+        settings.get("vector_window", DEFAULTS["vector_window"]),
+        prompt_hash,
+    )
+
+    history_text = [t.get("text") or "" for t in run["tokens"]]
+    if run["tokens"] and isinstance(run["tokens"][-1].get("embedding"), list):
+        vector_provider.prev = run["tokens"][-1]["embedding"]
+
+    token_index = len(run["tokens"])
+    generated_text = ""
+    remaining = max(0, settings.get("max_tokens", DEFAULTS["max_tokens"]) - token_index)
+    if max_new_tokens is not None:
+        remaining = min(remaining, max(0, int(max_new_tokens)))
+
+    while remaining > 0:
+        token, stop_info, model_name = generate_single_token_step(
+            base_url,
+            inference_prompt + generated_text,
+            settings,
+            model_name,
+            prompt_hash,
+            token_index,
+            history_text,
+            vector_provider,
+            started,
+        )
+        if model_name and meta.get("model") != model_name:
+            meta["model"] = model_name
+        if token is None:
+            break
+
+        token_text = token.get("text", "")
+        generated_text += token_text
+        history_text.append(token_text)
+        meta["providers"]["embedding"] = vector_provider.mode
+        add_token_local(run, token)
+        token_index += 1
+        remaining -= 1
+
+        if stop_info.get("hard_stop"):
+            break
+        if stop_info.get("stop") and remaining <= 0:
+            break
+
+    finalize_completed_run(run, started, status="complete")
+    return run
+
+
+def make_forced_token(target, chosen_alt, top_n_limit):
+    topn = target.get("topN") or []
+    return {
+        "index": target.get("index"),
+        "t": target.get("t"),
+        "text": chosen_alt.get("token_text", ""),
+        "chosen_token_id": chosen_alt.get("token_id"),
+        "chosen_token_text": chosen_alt.get("token_text", ""),
+        "logprob": chosen_alt.get("logprob"),
+        "prob": chosen_alt.get("prob"),
+        "entropy": target.get("entropy"),
+        "margin": target.get("margin"),
+        "topN": copy.deepcopy(topn[: top_n_limit]),
+        "topn_provider": target.get("topn_provider", "backend_logprobs"),
+    }
+
+
 def run_worker(run_id, stop_event):
     started = time.monotonic()
     error_message = None
@@ -1420,6 +1580,255 @@ def build_branch_run(body):
     )
 
 
+def sanitize_live_policy(raw_policy):
+    raw_policy = raw_policy if isinstance(raw_policy, dict) else {}
+    return {
+        "risk_threshold": sanitize_float(raw_policy.get("risk_threshold", 0.64), 0.64, minimum=0.0, maximum=1.0),
+        "risk_persistence": sanitize_int(raw_policy.get("risk_persistence", 2), 2, minimum=1, maximum=8),
+        "rollback_buffer": sanitize_int(raw_policy.get("rollback_buffer", 1), 1, minimum=0, maximum=6),
+        "branch_candidates": sanitize_int(raw_policy.get("branch_candidates", 3), 3, minimum=1, maximum=5),
+        "branch_lookahead": sanitize_int(raw_policy.get("branch_lookahead", 6), 6, minimum=1, maximum=24),
+        "max_interventions": sanitize_int(raw_policy.get("max_interventions", 2), 2, minimum=0, maximum=8),
+        "min_risk_drop": sanitize_float(raw_policy.get("min_risk_drop", 0.08), 0.08, minimum=0.0, maximum=1.0),
+        "cooldown_tokens": sanitize_int(raw_policy.get("cooldown_tokens", 4), 4, minimum=0, maximum=24),
+    }
+
+
+def rollback_index_for_run(run, policy):
+    tokens = run.get("tokens") or []
+    persistence = policy["risk_persistence"]
+    threshold = policy["risk_threshold"]
+    if len(tokens) < persistence:
+        return None, None
+
+    tail = tokens[-persistence:]
+    if not all((t.get("decoder_risk") or 0.0) >= threshold for t in tail):
+        return None, None
+
+    onset = len(tokens) - persistence
+    alert_index = None
+    for alert in reversed(run.get("analysis", {}).get("decoder_alerts") or []):
+        idx = alert.get("index")
+        if isinstance(idx, int) and idx <= len(tokens) - 1 and idx >= max(0, len(tokens) - 6):
+            alert_index = idx
+    rollback_index = max(0, min(onset, alert_index if alert_index is not None else onset) - policy["rollback_buffer"])
+    current_window = tokens[rollback_index:]
+    current_avg_risk = None
+    if current_window:
+        risks = [float(t.get("decoder_risk") or 0.0) for t in current_window]
+        current_avg_risk = sum(risks) / len(risks)
+    return rollback_index, current_avg_risk
+
+
+def run_candidate_branch(parent_run, rollback_index, alt_rank, lookahead):
+    parent_tokens = parent_run.get("tokens") or []
+    if rollback_index < 0 or rollback_index >= len(parent_tokens):
+        return None
+    target = parent_tokens[rollback_index]
+    topn = target.get("topN") or []
+    if alt_rank < 0 or alt_rank >= len(topn):
+        return None
+    chosen_alt = topn[alt_rank]
+
+    prefix_tokens = copy.deepcopy(parent_tokens[:rollback_index])
+    forced_token = make_forced_token(
+        target,
+        chosen_alt,
+        parent_run.get("meta", {}).get("generation_settings", {}).get("top_n", 5),
+    )
+    prefill_tokens = prefix_tokens + [forced_token]
+    prompt = parent_run.get("meta", {}).get("prompt", "")
+    inference_prompt = prompt + "".join(tok.get("text", "") for tok in prefill_tokens)
+
+    settings = copy.deepcopy(parent_run.get("meta", {}).get("generation_settings") or {})
+    run = create_run_object(
+        prompt=prompt,
+        base_url=parent_run.get("meta", {}).get("base_url", DEFAULTS["base_url"]),
+        settings=sanitize_settings(settings),
+        label=f"Candidate@{rollback_index}:{alt_rank}",
+        prefill_tokens=prefill_tokens,
+        inference_prompt=inference_prompt,
+    )
+    decode_run_local(run, max_new_tokens=lookahead)
+
+    candidate_window = run.get("tokens", [])[rollback_index:]
+    risks = [float(t.get("decoder_risk") or 0.0) for t in candidate_window] if candidate_window else []
+    return {
+        "run": run,
+        "alt_rank": alt_rank,
+        "alt_token_text": chosen_alt.get("token_text"),
+        "alt_token_id": chosen_alt.get("token_id"),
+        "avg_risk": (sum(risks) / len(risks)) if risks else None,
+        "max_risk": max(risks) if risks else None,
+        "token_count": len(run.get("tokens") or []),
+    }
+
+
+def run_live_correction_experiment(prompt, base_url, settings, policy):
+    baseline = create_run_object(prompt=prompt, base_url=base_url, settings=sanitize_settings(copy.deepcopy(settings)), label="Baseline")
+    corrected = create_run_object(prompt=prompt, base_url=base_url, settings=sanitize_settings(copy.deepcopy(settings)), label="Corrected")
+
+    decode_run_local(baseline)
+
+    started = time.monotonic()
+    initialize_prefill_tokens(corrected)
+    meta = corrected["meta"]
+    cfg = meta["generation_settings"]
+    prompt_hash = meta["prompt_hash"]
+    model_name = meta.get("model")
+    base_url = meta["base_url"]
+    inference_prompt = meta.get("inference_prompt") or meta.get("prompt", "")
+
+    vector_provider = VectorProvider(
+        cfg.get("vector_mode", "placeholder"),
+        base_url,
+        cfg.get("vector_dim", DEFAULTS["vector_dim"]),
+        cfg.get("vector_window", DEFAULTS["vector_window"]),
+        prompt_hash,
+    )
+    history_text = [t.get("text") or "" for t in corrected["tokens"]]
+    if corrected["tokens"] and isinstance(corrected["tokens"][-1].get("embedding"), list):
+        vector_provider.prev = corrected["tokens"][-1]["embedding"]
+
+    token_index = len(corrected["tokens"])
+    generated_text = ""
+    remaining = max(0, cfg.get("max_tokens", DEFAULTS["max_tokens"]) - token_index)
+    interventions = []
+    last_intervention_index = -999
+
+    while remaining > 0:
+        token, stop_info, model_name = generate_single_token_step(
+            base_url,
+            inference_prompt + generated_text,
+            cfg,
+            model_name,
+            prompt_hash,
+            token_index,
+            history_text,
+            vector_provider,
+            started,
+        )
+        if model_name and meta.get("model") != model_name:
+            meta["model"] = model_name
+        if token is None:
+            break
+
+        token_text = token.get("text", "")
+        generated_text += token_text
+        history_text.append(token_text)
+        meta["providers"]["embedding"] = vector_provider.mode
+        add_token_local(corrected, token)
+        token_index += 1
+        remaining -= 1
+
+        recompute_kinematics(corrected["tokens"])
+        enrich_decoder_diagnostics(corrected["tokens"])
+        corrected["analysis"]["regime_markers"] = detect_regime_markers(corrected["tokens"])
+        corrected["analysis"]["decoder_alerts"] = detect_decoder_alerts(corrected["tokens"])
+
+        if (
+            len(interventions) < policy["max_interventions"]
+            and len(corrected["tokens"]) - 1 >= last_intervention_index + policy["cooldown_tokens"]
+        ):
+            rollback_index, current_avg_risk = rollback_index_for_run(corrected, policy)
+            if rollback_index is not None:
+                trigger_index = len(corrected["tokens"]) - 1
+                target = corrected["tokens"][rollback_index]
+                topn = target.get("topN") or []
+                candidate_results = []
+                limit = min(len(topn), policy["branch_candidates"] + 1)
+                for alt_rank in range(1, limit):
+                    alt_text = str((topn[alt_rank] or {}).get("token_text") or "")
+                    if not alt_text.strip() or not any(ch.isalnum() for ch in alt_text):
+                        continue
+                    result = run_candidate_branch(corrected, rollback_index, alt_rank, policy["branch_lookahead"])
+                    if result is not None:
+                        candidate_results.append(result)
+
+                candidate_results = [c for c in candidate_results if c.get("avg_risk") is not None]
+                candidate_results.sort(key=lambda item: (item.get("avg_risk"), item.get("max_risk") or 0.0))
+
+                best = candidate_results[0] if candidate_results else None
+                if best is not None and current_avg_risk is not None and best["avg_risk"] <= (current_avg_risk - policy["min_risk_drop"]):
+                    corrected["tokens"] = best["run"]["tokens"]
+                    corrected["meta"]["providers"]["embedding"] = best["run"]["meta"]["providers"].get("embedding", corrected["meta"]["providers"].get("embedding"))
+                    recompute_kinematics(corrected["tokens"])
+                    enrich_decoder_diagnostics(corrected["tokens"])
+                    corrected["analysis"]["regime_markers"] = detect_regime_markers(corrected["tokens"])
+                    corrected["analysis"]["decoder_alerts"] = detect_decoder_alerts(corrected["tokens"])
+
+                    history_text = [t.get("text") or "" for t in corrected["tokens"]]
+                    token_index = len(corrected["tokens"])
+                    generated_text = "".join(history_text)
+                    remaining = max(0, cfg.get("max_tokens", DEFAULTS["max_tokens"]) - token_index)
+                    vector_provider = VectorProvider(
+                        corrected["meta"]["providers"].get("embedding", cfg.get("vector_mode", "placeholder")),
+                        base_url,
+                        cfg.get("vector_dim", DEFAULTS["vector_dim"]),
+                        cfg.get("vector_window", DEFAULTS["vector_window"]),
+                        prompt_hash,
+                    )
+                    if corrected["tokens"] and isinstance(corrected["tokens"][-1].get("embedding"), list):
+                        vector_provider.prev = corrected["tokens"][-1]["embedding"]
+
+                    interventions.append(
+                        {
+                            "mode": "prefix_replay",
+                            "trigger_index": trigger_index,
+                            "rollback_index": rollback_index,
+                            "baseline_avg_risk": current_avg_risk,
+                            "chosen_alt_rank": best["alt_rank"],
+                            "chosen_alt_text": best["alt_token_text"],
+                            "chosen_avg_risk": best["avg_risk"],
+                            "chosen_max_risk": best["max_risk"],
+                            "candidates": [
+                                {
+                                    "alt_rank": item["alt_rank"],
+                                    "alt_token_text": item["alt_token_text"],
+                                    "avg_risk": item["avg_risk"],
+                                    "max_risk": item["max_risk"],
+                                    "accepted": item["alt_rank"] == best["alt_rank"],
+                                }
+                                for item in candidate_results
+                            ],
+                        }
+                    )
+                    last_intervention_index = len(corrected["tokens"]) - 1
+
+        if stop_info.get("hard_stop"):
+            break
+        if stop_info.get("stop") and remaining <= 0:
+            break
+
+    finalize_completed_run(corrected, started, status="complete")
+    corrected.setdefault("analysis", {})["interventions"] = copy.deepcopy(interventions)
+
+    with RUNS_LOCK:
+        RUNS[baseline["run_id"]] = copy.deepcopy(baseline)
+        RUNS[corrected["run_id"]] = copy.deepcopy(corrected)
+        if baseline["run_id"] not in RUN_ORDER:
+            RUN_ORDER.append(baseline["run_id"])
+        if corrected["run_id"] not in RUN_ORDER:
+            RUN_ORDER.append(corrected["run_id"])
+
+    return {
+        "mode": "prefix_replay",
+        "baseline_run_id": baseline["run_id"],
+        "corrected_run_id": corrected["run_id"],
+        "baseline": baseline,
+        "corrected": corrected,
+        "interventions": interventions,
+        "policy": policy,
+        "metrics": {
+            "baseline_max_risk": baseline.get("summary", {}).get("decoder_risk_max"),
+            "corrected_max_risk": corrected.get("summary", {}).get("decoder_risk_max"),
+            "baseline_alerts": baseline.get("summary", {}).get("decoder_alert_count"),
+            "corrected_alerts": corrected.get("summary", {}).get("decoder_alert_count"),
+            "intervention_count": len(interventions),
+        },
+    }
+
+
 class TelemetryHandler(SimpleHTTPRequestHandler):
     def __init__(self, *args, directory=None, **kwargs):
         super().__init__(*args, directory=directory, **kwargs)
@@ -1521,6 +1930,32 @@ class TelemetryHandler(SimpleHTTPRequestHandler):
                 send_json(self, 400, {"error": "base_url is invalid"})
                 return
             send_json(self, 200, {"backend": probe_backend(base_url)})
+            return
+
+        if path == "/api/live-experiment":
+            prompt = (body.get("prompt") or "").strip()
+            raw_base_url = body.get("base_url") or DEFAULTS["base_url"]
+            if not prompt:
+                send_json(self, 400, {"error": "prompt is required"})
+                return
+            try:
+                base_url = normalize_base_url(raw_base_url)
+            except ValueError:
+                send_json(self, 400, {"error": "base_url is invalid"})
+                return
+
+            settings = sanitize_settings(body.get("settings"))
+            settings["chunk_size"] = 1
+            policy = sanitize_live_policy(body.get("policy"))
+            try:
+                result = run_live_correction_experiment(prompt, base_url, settings, policy)
+            except Exception as err:
+                send_json(self, 500, {"error": f"live experiment failed: {err}"})
+                return
+
+            broadcast_event({"type": "run_imported", "run": copy.deepcopy(result["baseline"])})
+            broadcast_event({"type": "run_imported", "run": copy.deepcopy(result["corrected"])})
+            send_json(self, 200, result)
             return
 
         if path in ("/api/start", "/api/generate"):

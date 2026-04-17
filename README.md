@@ -52,6 +52,7 @@ http://127.0.0.1:8765
 - Added per-token chips with top-N alternatives and branch regeneration.
 - Reframed the time-series panels around decoder diagnostics: uncertainty, choice gap, uncertainty jump, repetition pressure, decoder risk, and geometry motion.
 - Added audience-facing summary panels and backend/provenance checks for talks and demos.
+- Added an experimental `Live Branch Lab` subpage for baseline-vs-corrected decoder-risk intervention runs.
 
 ## Implemented on 2026-04-18
 
@@ -63,6 +64,7 @@ The current repo now includes the lecture/demo rewrite described above.
 - Restored 3D as an optional orbit mode instead of the main workflow, so the visual story stays strong without hiding the simpler 2D view.
 - Fixed geometry provenance so a run requested with `real` embeddings falls back and displays `placeholder vectors` when the backend does not actually expose `/embedding`.
 - Saved the next project backlog in [docs/NEXT_STEPS.md](docs/NEXT_STEPS.md).
+- Added a separate `Live Branch Lab` page that runs baseline vs corrected decode and links the resulting runs back into the main visualizer.
 
 ## Visual Evidence
 
@@ -77,6 +79,22 @@ This capture shows the audience summary, backend/provenance panel, run compariso
 This capture shows the optional 3D orbit projection for the same run family, kept as a secondary visual mode for stage/demo use.
 
 ![3D orbit mode evidence](docs/evidence/2026-04-18-lecture-ui-3d.png)
+
+## Live Branch Lab
+
+An experimental second page is now available at `./live.html`.
+
+What it does:
+- runs a baseline decode and a corrected decode with the same prompt/settings
+- watches decoder-risk token-by-token
+- when the risk stays high long enough, it replays from an earlier prefix and evaluates a few alternative next-token branches
+- chooses a lower-risk branch only if the measured reduction is large enough
+
+Current limitation:
+- this is a `prefix_replay` intervention, not exact KV-state rollback
+- lower decoder risk after branching is useful evidence, but it is not proof of factual correctness
+
+The repeatable evaluation plan for this page lives in [docs/LIVE_BRANCH_EVAL.md](docs/LIVE_BRANCH_EVAL.md).
 
 ## Research Recalibration (2026-04-17)
 

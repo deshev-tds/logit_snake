@@ -2403,6 +2403,36 @@ async function refreshRunsFromServer() {
   }
 }
 
+function applyUrlSelection() {
+  const params = new URLSearchParams(window.location.search);
+  const runA = params.get('runA');
+  const runB = params.get('runB');
+  const diff = params.get('diff');
+
+  let changed = false;
+  if (runA && state.runs.has(runA)) {
+    state.runAId = runA;
+    changed = true;
+  }
+  if (runB && state.runs.has(runB)) {
+    state.runBId = runB;
+    changed = true;
+  }
+  if (diff != null) {
+    state.diffEnabled = diff === '1' || diff === 'true';
+    changed = true;
+  }
+
+  if (changed) {
+    renderRunSelectors();
+    renderBookmarks();
+    renderMutations();
+    renderTokens(true);
+    syncTimelineBounds();
+    state.needsRender = true;
+  }
+}
+
 async function probeBackend() {
   const baseUrl = normalizeBaseUrl(ui.endpoint.value);
   if (!baseUrl) {
@@ -2877,6 +2907,7 @@ async function bootstrap() {
   bindUI();
   wireSSE();
   await refreshRunsFromServer();
+  applyUrlSelection();
 
   const status = await apiGet('/api/status').catch(() => null);
   if (status?.defaults?.base_url) ui.endpoint.value = String(status.defaults.base_url);

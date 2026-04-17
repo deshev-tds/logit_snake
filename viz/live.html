@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>LLM Snake Scope - Live Branch Lab</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div id="app">
+    <nav id="site-nav" class="panel">
+      <a class="nav-link" href="./">Snake Scope</a>
+      <a class="nav-link active" href="./live.html">Live Branch Lab</a>
+    </nav>
+
+    <header id="topbar" class="panel">
+      <div class="title-wrap">
+        <h1>Live Branch Lab</h1>
+        <p>Experimental decoder-risk intervention: detect instability, replay from a safer prefix, and compare against baseline.</p>
+      </div>
+      <div id="generation-grid">
+        <label>Endpoint
+          <input id="endpoint-input" type="text" value="http://127.0.0.1:8080" />
+        </label>
+        <label>Prompt
+          <textarea id="prompt-input" rows="4" placeholder="Ask for a factual answer or a biography-style answer that may drift into invented detail."></textarea>
+        </label>
+        <label>Seed
+          <input id="seed-input" type="number" value="1234" />
+        </label>
+        <label>Temperature
+          <input id="temperature-input" type="number" step="0.01" min="0" max="2" value="0.7" />
+        </label>
+        <label>Top P
+          <input id="top-p-input" type="number" step="0.01" min="0" max="1" value="0.95" />
+        </label>
+        <label>Max Tokens
+          <input id="max-tokens-input" type="number" min="8" max="256" value="64" />
+        </label>
+        <label>Geometry Source
+          <select id="vector-mode-select">
+            <option value="placeholder" selected>Placeholder</option>
+            <option value="real">Real Embeddings</option>
+          </select>
+        </label>
+        <label>Risk Threshold
+          <input id="risk-threshold-input" type="number" step="0.01" min="0" max="1" value="0.64" />
+        </label>
+        <label>Persistence
+          <input id="risk-persistence-input" type="number" min="1" max="8" value="2" />
+        </label>
+        <label>Rollback Buffer
+          <input id="rollback-buffer-input" type="number" min="0" max="6" value="1" />
+        </label>
+        <label>Branch Candidates
+          <input id="branch-candidates-input" type="number" min="1" max="5" value="3" />
+        </label>
+        <label>Lookahead
+          <input id="branch-lookahead-input" type="number" min="1" max="24" value="6" />
+        </label>
+        <label>Max Interventions
+          <input id="max-interventions-input" type="number" min="0" max="8" value="2" />
+        </label>
+      </div>
+      <div id="action-row">
+        <button id="run-btn" class="accent">Run Experiment</button>
+        <button id="probe-backend-btn">Probe Backend</button>
+        <span id="status-badge">Idle</span>
+      </div>
+      <div class="info-note">
+        This page does not claim to make the model truthful. In the current implementation, intervention uses <strong>prefix replay</strong>, not exact KV-state rewind.
+        Because llama.cpp's streaming mode does not expose token-probability telemetry token-by-token, the lab runs one-token decode steps (`n_predict=1`) to observe risk and decide whether to branch.
+      </div>
+    </header>
+
+    <main id="workspace">
+      <section id="visual-panel" class="panel">
+        <div class="panel-head">
+          <div>
+            <h2>Experiment Result</h2>
+            <p id="experiment-meta">No experiment has been run yet.</p>
+          </div>
+          <div class="action-links">
+            <a id="open-main-link" class="nav-link" href="./" target="_blank" rel="noreferrer">Open In Snake Scope</a>
+          </div>
+        </div>
+
+        <section class="subpanel">
+          <h3>What This Proves</h3>
+          <div id="experiment-summary" class="info-note">Run a baseline vs corrected decode to compare decoder-risk trajectory and intervention count.</div>
+        </section>
+
+        <section class="result-grid">
+          <section class="subpanel">
+            <h3>Baseline</h3>
+            <div class="kv"><span>Run ID</span><strong id="baseline-run-id">-</strong></div>
+            <div class="kv"><span>Max Risk</span><strong id="baseline-risk">-</strong></div>
+            <div class="kv"><span>Alerts</span><strong id="baseline-alerts">-</strong></div>
+            <div class="kv"><span>Tokens</span><strong id="baseline-tokens">-</strong></div>
+            <div id="baseline-text" class="text-block">-</div>
+          </section>
+
+          <section class="subpanel">
+            <h3>Corrected</h3>
+            <div class="kv"><span>Run ID</span><strong id="corrected-run-id">-</strong></div>
+            <div class="kv"><span>Max Risk</span><strong id="corrected-risk">-</strong></div>
+            <div class="kv"><span>Alerts</span><strong id="corrected-alerts">-</strong></div>
+            <div class="kv"><span>Tokens</span><strong id="corrected-tokens">-</strong></div>
+            <div id="corrected-text" class="text-block">-</div>
+          </section>
+        </section>
+      </section>
+
+      <aside id="inspector-panel" class="panel">
+        <section class="subpanel">
+          <h3>Backend & Provenance</h3>
+          <div class="kv"><span>Reachable</span><strong id="backend-reachable">-</strong></div>
+          <div class="kv"><span>Model</span><strong id="backend-model">-</strong></div>
+          <div class="kv"><span>Token Probs</span><strong id="backend-probs">-</strong></div>
+          <div class="kv"><span>Embeddings</span><strong id="backend-embeddings">-</strong></div>
+          <div class="kv"><span>Intervention Mode</span><strong id="backend-mode">prefix_replay</strong></div>
+        </section>
+
+        <section class="subpanel">
+          <h3>Interventions</h3>
+          <div class="kv"><span>Count</span><strong id="intervention-count">0</strong></div>
+          <div id="intervention-list"></div>
+        </section>
+
+        <section class="subpanel">
+          <h3>Limitations</h3>
+          <div class="info-note">
+            Lower decoder risk after branching is evidence of a gentler continuation, not proof of factual correctness.
+            Stronger evidence will come from repeatable evaluation against claim/span labels or retrieval-backed support checks.
+          </div>
+        </section>
+      </aside>
+    </main>
+  </div>
+
+  <script type="module" src="live.js"></script>
+</body>
+</html>
