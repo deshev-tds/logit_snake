@@ -45,6 +45,8 @@ const ui = {
 const state = {
   backendInfo: null,
   lastResult: null,
+  currentExperimentId: null,
+  partialInterventions: [],
 };
 
 function asNumber(value, fallback = null) {
@@ -186,6 +188,93 @@ function renderInterventions(result) {
   });
 }
 
+function resetExperimentView() {
+  state.lastResult = null;
+  state.partialInterventions = [];
+  ui.experimentMeta.textContent = 'Experiment is running...';
+  ui.experimentSummary.textContent = 'Waiting for the first token-level updates from the live experiment loop.';
+  ui.baselineRunId.textContent = '-';
+  ui.baselineRisk.textContent = '-';
+  ui.baselineAlerts.textContent = '-';
+  ui.baselineTokens.textContent = '-';
+  ui.baselineText.textContent = '-';
+  ui.correctedRunId.textContent = '-';
+  ui.correctedRisk.textContent = '-';
+  ui.correctedAlerts.textContent = '-';
+  ui.correctedTokens.textContent = '-';
+  ui.correctedText.textContent = '-';
+  ui.interventionCount.textContent = '0';
+  ui.interventionList.innerHTML = '<div class=\"empty-list\">No intervention has been triggered yet.</div>';
+}
+
+function renderPartialInterventions() {
+  renderInterventions({ interventions: state.partialInterventions });
+}
+
+function updateProgress(event) {
+  const phase = event?.phase;
+  if (phase === 'baseline') {
+    ui.baselineRunId.textContent = event.run_id || ui.baselineRunId.textContent;
+    ui.baselineTokens.textContent = String(event.token_count ?? ui.baselineTokens.textContent);
+    ui.baselineRisk.textContent = formatPercent(event.decoder_risk, 0);
+    ui.baselineText.textContent = event.text || ui.baselineText.textContent;
+    setStatus(`Baseline token ${event.token_index + 1}`, 'neutral');
+  } else if (phase === 'corrected') {
+    ui.correctedRunId.textContent = event.run_id || ui.correctedRunId.textContent;
+    ui.correctedTokens.textContent = String(event.token_count ?? ui.correctedTokens.textContent);
+    ui.correctedRisk.textContent = formatPercent(event.decoder_risk, 0);
+    ui.correctedText.textContent = event.text || ui.correctedText.textContent;
+    setStatus(`Corrected token ${event.token_index + 1}`, 'neutral');
+  }
+}
+
+function connectStream() {
+  const source = new EventSource('/stream');
+  source.onmessage = (message) => {
+    let payload;
+    try {
+      payload = JSON.parse(message.data);
+    } catch {
+      return;
+    }
+    if (!payload?.type) return;
+    if (!payload.experiment_id || payload.experiment_id !== state.currentExperimentId) return;
+
+    if (payload.type === 'live_experiment_started') {
+      ui.baselineRunId.textContent = payload.baseline_run_id || '-';
+      ui.correctedRunId.textContent = payload.corrected_run_id || '-';
+      ui.experimentMeta.textContent = `Mode=${payload.mode || 'prefix_replay'} | baseline=${payload.baseline_run_id || '-'} | corrected=${payload.corrected_run_id || '-'}`;
+      return;
+    }
+
+    if (payload.type === 'live_experiment_progress') {
+      updateProgress(payload);
+      return;
+    }
+
+    if (payload.type === 'live_experiment_intervention') {
+      state.partialInterventions.push(payload);
+      renderPartialInterventions();
+      if (payload.corrected_text) {
+        ui.correctedText.textContent = payload.corrected_text;
+      }
+      setStatus(`Intervention at token ${payload.trigger_index}`, 'neutral');
+      return;
+    }
+
+    if (payload.type === 'live_experiment_completed') {
+      renderResult(payload);
+      setStatus('Experiment completed.', 'success');
+    }
+  };
+
+  source.onerror = () => {
+    if (state.currentExperimentId) {
+      setStatus('Stream reconnecting...', 'neutral');
+    }
+  };
+}
+
 function renderResult(result) {
   state.lastResult = result;
   const baseline = result?.baseline;
@@ -270,8 +359,11 @@ async function runExperiment() {
   };
 
   try {
+    state.currentExperimentId = `exp_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`;
+    resetExperimentView();
     setStatus('Running baseline and corrected decode...', 'neutral');
     const result = await apiPost('/api/live-experiment', {
+      experiment_id: state.currentExperimentId,
       prompt,
       base_url: baseUrl,
       settings,
@@ -296,6 +388,7 @@ async function bootstrap() {
     if (normalized) ui.endpoint.value = normalized;
   });
 
+  connectStream();
   await probeBackend().catch(() => null);
 }
 

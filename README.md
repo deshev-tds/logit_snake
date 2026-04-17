@@ -51,34 +51,39 @@ http://127.0.0.1:8765
 - Added run management (`Run A`, `Run B`), diff overlay, and alignment summary.
 - Added per-token chips with top-N alternatives and branch regeneration.
 - Reframed the time-series panels around decoder diagnostics: uncertainty, choice gap, uncertainty jump, repetition pressure, decoder risk, and geometry motion.
-- Added audience-facing summary panels and backend/provenance checks for talks and demos.
+- Added plain-language summary panels and backend/provenance checks.
 - Added an experimental `Live Branch Lab` subpage for baseline-vs-corrected decoder-risk intervention runs.
 
 ## Implemented on 2026-04-18
 
-The current repo now includes the lecture/demo rewrite described above.
+The current repo now includes the decoder-diagnostics rewrite described above.
 
 - Added `Probe Backend` and backend provenance so the UI shows whether token probabilities and embeddings are really available.
-- Added audience-facing plain-language summaries (`Current Risk`, `Why Now`, `What To Say`) next to the plots.
-- Replaced the old metric stack with decoder-side diagnostics that are easier to explain honestly in public: uncertainty, choice gap, uncertainty jump, repetition pressure, decoder risk, and geometry motion.
-- Restored 3D as an optional orbit mode instead of the main workflow, so the visual story stays strong without hiding the simpler 2D view.
+- Added plain-language summaries (`Current Risk`, `Why Now`, `What To Say`) next to the plots.
+- Replaced the old metric stack with decoder-side diagnostics: uncertainty, choice gap, uncertainty jump, repetition pressure, decoder risk, and geometry motion.
+- Restored 3D as an optional orbit mode instead of the main workflow.
 - Fixed geometry provenance so a run requested with `real` embeddings falls back and displays `placeholder vectors` when the backend does not actually expose `/embedding`.
 - Saved the next project backlog in [docs/NEXT_STEPS.md](docs/NEXT_STEPS.md).
 - Added a separate `Live Branch Lab` page that runs baseline vs corrected decode and links the resulting runs back into the main visualizer.
+- Added live-ish incremental updates for `Live Branch Lab` via SSE so the page shows baseline/corrected progress before the final response returns.
+- Measured the current latency envelope on a fixed `max_tokens=18` / single-intervention benchmark:
+  - backend mean completion time: about `4.08s` before SSE vs `4.12s` after SSE
+  - first visible UI update: about `4.07s` before SSE vs `0.08s` after SSE
+  - first visible token text: about `0.23s` after SSE
 
 ## Visual Evidence
 
-### 2D Lecture Mode
+### 2D Main View
 
-This capture shows the audience summary, backend/provenance panel, run comparison panel, and the new decoder diagnostics.
+This capture shows the plain-language summary, backend/provenance panel, run comparison panel, and the decoder diagnostics.
 
-![2D lecture mode evidence](docs/evidence/2026-04-18-lecture-ui-2d.png)
+![2D main view evidence](docs/evidence/2026-04-18-main-ui-2d.png)
 
 ### 3D Orbit Mode
 
-This capture shows the optional 3D orbit projection for the same run family, kept as a secondary visual mode for stage/demo use.
+This capture shows the optional 3D orbit projection for the same run family.
 
-![3D orbit mode evidence](docs/evidence/2026-04-18-lecture-ui-3d.png)
+![3D orbit view evidence](docs/evidence/2026-04-18-orbit-ui-3d.png)
 
 ## Live Branch Lab
 
@@ -323,7 +328,7 @@ Branch metadata is persisted in `meta.branch`.
 ### Projection Choice
 
 - High-dimensional vectors are projected to 2D with deterministic PCA.
-- Optional `3D Orbit` mode projects the same run set into PCA-3 and lets the audience rotate the view.
+- Optional `3D Orbit` mode projects the same run set into PCA-3 and allows interactive rotation.
 - In single-run mode: PCA fitted on Run A.
 - In diff mode: PCA fitted on concatenated vectors from Run A + Run B, so both trajectories share one coordinate frame.
 - Projection output is cached by `(run ids + token lengths)` for smooth replay.
@@ -341,7 +346,7 @@ They should not be interpreted as a calibrated answer to "hallucination started 
 
 ### Decoder Diagnostics
 
-The primary lecture-facing signals are now:
+The primary decoder-side signals are now:
 - normalized next-token uncertainty
 - probability gap between the top two token choices
 - uncertainty jump from the previous token

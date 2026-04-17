@@ -1145,7 +1145,11 @@ def add_token_local(run, token):
     run["meta"]["providers"]["embedding"] = run["meta"]["providers"].get("embedding")
 
 
-def decode_run_local(run, max_new_tokens=None):
+def joined_run_text(run):
+    return "".join((token.get("text") or "") for token in (run.get("tokens") or []))
+
+
+def decode_run_local(run, max_new_tokens=None, progress_cb=None, phase=None):
     started = time.monotonic()
     initialize_prefill_tokens(run)
 
@@ -1196,6 +1200,22 @@ def decode_run_local(run, max_new_tokens=None):
         history_text.append(token_text)
         meta["providers"]["embedding"] = vector_provider.mode
         add_token_local(run, token)
+        recompute_kinematics(run["tokens"])
+        enrich_decoder_diagnostics(run["tokens"])
+        run["analysis"]["regime_markers"] = detect_regime_markers(run["tokens"])
+        run["analysis"]["decoder_alerts"] = detect_decoder_alerts(run["tokens"])
+        if progress_cb is not None:
+            progress_cb(
+                {
+                    "phase": phase,
+                    "run_id": run["run_id"],
+                    "token_index": token_index,
+                    "token_text": token_text,
+                    "decoder_risk": token.get("decoder_risk"),
+                    "text": joined_run_text(run),
+                    "token_count": len(run["tokens"]),
+                }
+            )
         token_index += 1
         remaining -= 1
 
@@ -1664,11 +1684,31 @@ def run_candidate_branch(parent_run, rollback_index, alt_rank, lookahead):
     }
 
 
-def run_live_correction_experiment(prompt, base_url, settings, policy):
+def run_live_correction_experiment(prompt, base_url, settings, policy, experiment_id=None):
+    def progress(event_type, payload):
+        if not experiment_id:
+            return
+        event = {"type": event_type, "experiment_id": experiment_id}
+        event.update(payload)
+        broadcast_event(event)
+
     baseline = create_run_object(prompt=prompt, base_url=base_url, settings=sanitize_settings(copy.deepcopy(settings)), label="Baseline")
     corrected = create_run_object(prompt=prompt, base_url=base_url, settings=sanitize_settings(copy.deepcopy(settings)), label="Corrected")
 
-    decode_run_local(baseline)
+    progress(
+        "live_experiment_started",
+        {
+            "baseline_run_id": baseline["run_id"],
+            "corrected_run_id": corrected["run_id"],
+            "mode": "prefix_replay",
+        },
+    )
+
+    decode_run_local(
+        baseline,
+        progress_cb=lambda payload: progress("live_experiment_progress", payload),
+        phase="baseline",
+    )
 
     started = time.monotonic()
     initialize_prefill_tokens(corrected)
@@ -1718,6 +1758,18 @@ def run_live_correction_experiment(prompt, base_url, settings, policy):
         history_text.append(token_text)
         meta["providers"]["embedding"] = vector_provider.mode
         add_token_local(corrected, token)
+        progress(
+            "live_experiment_progress",
+            {
+                "phase": "corrected",
+                "run_id": corrected["run_id"],
+                "token_index": token_index,
+                "token_text": token_text,
+                "decoder_risk": token.get("decoder_risk"),
+                "text": joined_run_text(corrected),
+                "token_count": len(corrected["tokens"]),
+            },
+        )
         token_index += 1
         remaining -= 1
 
@@ -1792,6 +1844,30 @@ def run_live_correction_experiment(prompt, base_url, settings, policy):
                                 for item in candidate_results
                             ],
                         }
+                    )
+                    progress(
+                        "live_experiment_intervention",
+                        {
+                            "rollback_index": rollback_index,
+                            "trigger_index": trigger_index,
+                            "baseline_avg_risk": current_avg_risk,
+                            "chosen_alt_rank": best["alt_rank"],
+                            "chosen_alt_text": best["alt_token_text"],
+                            "chosen_avg_risk": best["avg_risk"],
+                            "chosen_max_risk": best["max_risk"],
+                            "candidates": [
+                                {
+                                    "alt_rank": item["alt_rank"],
+                                    "alt_token_text": item["alt_token_text"],
+                                    "avg_risk": item["avg_risk"],
+                                    "max_risk": item["max_risk"],
+                                    "accepted": item["alt_rank"] == best["alt_rank"],
+                                }
+                                for item in candidate_results
+                            ],
+                            "corrected_text": joined_run_text(corrected),
+                            "corrected_run_id": corrected["run_id"],
+                        },
                     )
                     last_intervention_index = len(corrected["tokens"]) - 1
 
@@ -1935,6 +2011,7 @@ class TelemetryHandler(SimpleHTTPRequestHandler):
         if path == "/api/live-experiment":
             prompt = (body.get("prompt") or "").strip()
             raw_base_url = body.get("base_url") or DEFAULTS["base_url"]
+            experiment_id = body.get("experiment_id")
             if not prompt:
                 send_json(self, 400, {"error": "prompt is required"})
                 return
@@ -1948,13 +2025,17 @@ class TelemetryHandler(SimpleHTTPRequestHandler):
             settings["chunk_size"] = 1
             policy = sanitize_live_policy(body.get("policy"))
             try:
-                result = run_live_correction_experiment(prompt, base_url, settings, policy)
+                result = run_live_correction_experiment(prompt, base_url, settings, policy, experiment_id=experiment_id)
             except Exception as err:
                 send_json(self, 500, {"error": f"live experiment failed: {err}"})
                 return
 
             broadcast_event({"type": "run_imported", "run": copy.deepcopy(result["baseline"])})
             broadcast_event({"type": "run_imported", "run": copy.deepcopy(result["corrected"])})
+            if experiment_id:
+                completed_event = {"type": "live_experiment_completed", "experiment_id": experiment_id}
+                completed_event.update(copy.deepcopy(result))
+                broadcast_event(completed_event)
             send_json(self, 200, result)
             return
 

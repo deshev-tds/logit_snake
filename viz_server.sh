@@ -6,15 +6,22 @@ PID_FILE="$ROOT_DIR/.viz_server.pid"
 LOG_FILE="$ROOT_DIR/viz_server.log"
 PORT="${PORT:-8765}"
 HOST="${HOST:-127.0.0.1}"
+DEFAULT_BASE_URL="${DEFAULT_BASE_URL:-http://127.0.0.1:8080}"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 start_server() {
   if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
     echo "viz_server already running (pid $(cat "$PID_FILE"))"
     return 0
   fi
-  nohup python3 "$ROOT_DIR/viz_server.py" --host "$HOST" --port "$PORT" --static-dir "$ROOT_DIR/viz" >"$LOG_FILE" 2>&1 &
+  nohup "$PYTHON_BIN" "$ROOT_DIR/viz_server.py" \
+    --host "$HOST" \
+    --port "$PORT" \
+    --static-dir "$ROOT_DIR/viz" \
+    --default-base-url "$DEFAULT_BASE_URL" \
+    >"$LOG_FILE" 2>&1 &
   echo $! > "$PID_FILE"
-  echo "viz_server started on http://$HOST:$PORT (pid $(cat "$PID_FILE"))"
+  echo "viz_server started on http://$HOST:$PORT (pid $(cat "$PID_FILE")), default base URL: $DEFAULT_BASE_URL"
 }
 
 stop_server() {
