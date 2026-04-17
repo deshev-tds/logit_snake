@@ -5,7 +5,9 @@ const ui = {
   temperature: document.getElementById('temperature-input'),
   topP: document.getElementById('top-p-input'),
   maxTokens: document.getElementById('max-tokens-input'),
+  vectorMode: document.getElementById('vector-mode-select'),
   generateBtn: document.getElementById('generate-btn'),
+  probeBackendBtn: document.getElementById('probe-backend-btn'),
   stopBtn: document.getElementById('stop-btn'),
   loadFileBtn: document.getElementById('load-file-btn'),
   exportBtn: document.getElementById('export-btn'),
@@ -14,6 +16,7 @@ const ui = {
 
   runASelect: document.getElementById('run-a-select'),
   runBSelect: document.getElementById('run-b-select'),
+  projectionMode: document.getElementById('projection-mode-select'),
   diffToggle: document.getElementById('diff-toggle'),
   shiftThreshold: document.getElementById('shift-threshold-input'),
   runMeta: document.getElementById('run-meta'),
@@ -32,6 +35,16 @@ const ui = {
   diffFirst: document.getElementById('diff-first'),
   diffAlignment: document.getElementById('diff-alignment'),
 
+  storyRisk: document.getElementById('story-risk'),
+  storyReasons: document.getElementById('story-reasons'),
+  storyMeaning: document.getElementById('story-meaning'),
+
+  backendReachable: document.getElementById('backend-reachable'),
+  backendModel: document.getElementById('backend-model'),
+  backendProbs: document.getElementById('backend-probs'),
+  backendEmbeddings: document.getElementById('backend-embeddings'),
+  backendGeometry: document.getElementById('backend-geometry'),
+
   bookmarkBtn: document.getElementById('bookmark-btn'),
   bookmarkList: document.getElementById('bookmark-list'),
   mutationCount: document.getElementById('mutation-count'),
@@ -39,10 +52,12 @@ const ui = {
 
   tokenStream: document.getElementById('token-stream'),
 
-  metricEntropy: document.getElementById('metric-entropy'),
-  metricMargin: document.getElementById('metric-margin'),
+  metricUncertainty: document.getElementById('metric-uncertainty'),
+  metricGap: document.getElementById('metric-gap'),
+  metricJump: document.getElementById('metric-jump'),
+  metricRepeat: document.getElementById('metric-repeat'),
+  metricRisk: document.getElementById('metric-risk'),
   metricVelocity: document.getElementById('metric-velocity'),
-  metricCurvature: document.getElementById('metric-curvature'),
 
   popup: document.getElementById('token-popup'),
   popupTitle: document.getElementById('popup-title'),
@@ -104,6 +119,15 @@ const state = {
   popup: null,
   diffContext: null,
   serverRunning: false,
+  backendInfo: null,
+  projectionMode: '2d',
+  view3d: {
+    yaw: 0.72,
+    pitch: -0.44,
+    dragging: false,
+    lastX: 0,
+    lastY: 0,
+  },
 };
 
 function clamp(value, minValue, maxValue) {
@@ -118,6 +142,11 @@ function asNumber(value, fallback = null) {
 function formatNum(value, digits = 3) {
   if (value == null || !Number.isFinite(value)) return '-';
   return Number(value).toFixed(digits);
+}
+
+function formatPercent(value, digits = 0) {
+  if (value == null || !Number.isFinite(value)) return '-';
+  return `${(Number(value) * 100).toFixed(digits)}%`;
 }
 
 function hashString(input) {
@@ -329,6 +358,34 @@ function marginFromTopN(topN) {
   return lp1 - lp2;
 }
 
+function observedMassFromTopN(topN) {
+  if (!Array.isArray(topN) || !topN.length) return null;
+  let mass = 0;
+  for (const item of topN) {
+    mass += Math.max(0, asNumber(item.prob, 0));
+  }
+  return clamp(mass, 0, 1);
+}
+
+function probGapFromTopN(topN) {
+  if (!Array.isArray(topN) || !topN.length) {
+    return { top1: null, top2: null, gap: null };
+  }
+  const top1 = Math.max(0, asNumber(topN[0]?.prob, 0));
+  const top2 = Math.max(0, asNumber(topN[1]?.prob, 0));
+  return {
+    top1,
+    top2,
+    gap: clamp(top1 - top2, 0, 1),
+  };
+}
+
+function normalizeRepeatToken(text) {
+  const raw = String(text ?? '');
+  const compact = raw.replace(/\s+/g, ' ').trim().toLowerCase();
+  return compact || raw.trim().toLowerCase() || raw.toLowerCase();
+}
+
 function angleBetween(a, b) {
   if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return null;
   let dot = 0;
@@ -357,6 +414,18 @@ function vectorDistance(a, b) {
   for (let i = 0; i < a.length; i += 1) {
     const d = a[i] - b[i];
     acc += d * d;
+  }
+  return Math.sqrt(acc);
+}
+
+function pointDistance(a, b) {
+  if (!a || !b) return null;
+  const dims = ('z' in a || 'z' in b) ? ['x', 'y', 'z'] : ['x', 'y'];
+  let acc = 0;
+  for (const key of dims) {
+    const da = asNumber(a[key], 0);
+    const db = asNumber(b[key], 0);
+    acc += (da - db) ** 2;
   }
   return Math.sqrt(acc);
 }
@@ -405,6 +474,16 @@ function normalizeToken(raw, run, index, prevVector = null) {
     embedding: null,
     velocity: asNumber(raw?.velocity),
     curvature: asNumber(raw?.curvature),
+    observed_mass: asNumber(raw?.observed_mass),
+    top1_prob: asNumber(raw?.top1_prob),
+    top2_prob: asNumber(raw?.top2_prob),
+    prob_gap: asNumber(raw?.prob_gap),
+    uncertainty: asNumber(raw?.uncertainty),
+    entropy_delta: asNumber(raw?.entropy_delta),
+    repeat_unigram: asNumber(raw?.repeat_unigram),
+    repeat_bigram: asNumber(raw?.repeat_bigram),
+    repetition_pressure: asNumber(raw?.repetition_pressure),
+    decoder_risk: asNumber(raw?.decoder_risk),
     topn_provider: raw?.topn_provider || 'backend_logprobs',
   };
 
@@ -466,6 +545,69 @@ function recomputeKinematics(run) {
   }
 }
 
+function enrichDecoderDiagnostics(run) {
+  const tokens = run.tokens || [];
+  let previousEntropy = null;
+  const seenNormTokens = [];
+  const seenBigrams = [];
+
+  for (let i = 0; i < tokens.length; i += 1) {
+    const token = tokens[i];
+    const probStats = probGapFromTopN(token.topN);
+    if (token.observed_mass == null) token.observed_mass = observedMassFromTopN(token.topN);
+    if (token.top1_prob == null) token.top1_prob = probStats.top1;
+    if (token.top2_prob == null) token.top2_prob = probStats.top2;
+    if (token.prob_gap == null) token.prob_gap = probStats.gap;
+
+    if (token.uncertainty == null && token.entropy != null) {
+      const denom = Math.log(Math.max(2, (token.topN?.length || 0) + 1));
+      token.uncertainty = denom > 0 ? clamp(token.entropy / denom, 0, 1) : null;
+    }
+
+    if (token.entropy_delta == null && token.entropy != null && previousEntropy != null) {
+      token.entropy_delta = Math.abs(token.entropy - previousEntropy);
+    }
+    if (token.entropy != null) previousEntropy = token.entropy;
+
+    const currNorm = normalizeRepeatToken(token.text || token.chosen_token_text || '');
+    const lookback = seenNormTokens.slice(-12);
+    const unigramHits = lookback.filter((item) => item && item === currNorm).length;
+    if (token.repeat_unigram == null) {
+      token.repeat_unigram = lookback.length ? unigramHits / lookback.length : 0;
+    }
+
+    const prevNorm = seenNormTokens.length ? seenNormTokens[seenNormTokens.length - 1] : '';
+    const bigram = (prevNorm || currNorm) ? `${prevNorm}|${currNorm}` : '';
+    const bigramHits = seenBigrams.slice(-12).filter((item) => item && item === bigram).length;
+    if (token.repeat_bigram == null) {
+      token.repeat_bigram = bigramHits > 0 ? 1 : 0;
+    }
+
+    if (token.repetition_pressure == null) {
+      token.repetition_pressure = clamp(0.6 * (token.repeat_unigram || 0) + 0.4 * (token.repeat_bigram || 0), 0, 1);
+    }
+
+    if (token.decoder_risk == null) {
+      const uncertainty = asNumber(token.uncertainty);
+      const gapRisk = token.prob_gap == null ? null : clamp(1 - token.prob_gap, 0, 1);
+      const volatility = token.entropy_delta == null ? null : clamp(token.entropy_delta / 0.75, 0, 1);
+      if (uncertainty != null || gapRisk != null || volatility != null) {
+        token.decoder_risk = clamp(
+          0.38 * (uncertainty || 0)
+          + 0.24 * (gapRisk || 0)
+          + 0.22 * (volatility || 0)
+          + 0.16 * (token.repetition_pressure || 0),
+          0,
+          1
+        );
+      }
+    }
+
+    seenNormTokens.push(currNorm);
+    seenBigrams.push(bigram);
+  }
+}
+
 function detectRegimeMarkers(run) {
   const tokens = run.tokens;
   if (!tokens || tokens.length < 4) return [];
@@ -503,6 +645,25 @@ function detectRegimeMarkers(run) {
   return markers;
 }
 
+function detectDecoderAlerts(run) {
+  const tokens = run.tokens || [];
+  const alerts = [];
+  let last = -10;
+  for (let i = 0; i < tokens.length; i += 1) {
+    const token = tokens[i];
+    const reasons = [];
+    if (asNumber(token.uncertainty) != null && token.uncertainty >= 0.72) reasons.push('high_uncertainty');
+    if (asNumber(token.prob_gap) != null && token.prob_gap <= 0.12) reasons.push('weak_choice_gap');
+    if (asNumber(token.entropy_delta) != null && token.entropy_delta >= 0.38) reasons.push('uncertainty_jump');
+    if (asNumber(token.repetition_pressure) != null && token.repetition_pressure >= 0.45) reasons.push('repetition_pressure');
+    if (asNumber(token.decoder_risk) != null && token.decoder_risk >= 0.64 && i - last >= 3) {
+      alerts.push({ index: i, risk: token.decoder_risk, reasons: reasons.length ? reasons : ['decoder_risk'] });
+      last = i;
+    }
+  }
+  return alerts;
+}
+
 function finalizeRun(rawRun, source = 'server') {
   const rawMeta = (rawRun?.meta && typeof rawRun.meta === 'object') ? rawRun.meta : {};
   const run = {
@@ -534,7 +695,9 @@ function finalizeRun(rawRun, source = 'server') {
   }
 
   recomputeKinematics(run);
+  enrichDecoderDiagnostics(run);
   run.analysis.regime_markers = detectRegimeMarkers(run);
+  run.analysis.decoder_alerts = detectDecoderAlerts(run);
   run.summary.token_count = run.tokens.length;
 
   return run;
@@ -732,16 +895,92 @@ function updateRunMeta() {
   const latestText = latest
     ? `latest @${latest.fork_index}: ${compactToken(latest.from_text)} -> ${compactToken(latest.to_text)}`
     : '';
+  const providers = meta.providers || {};
+  const geometryText = providers.embedding === 'real' ? 'geometry=real' : 'geometry=placeholder';
+  const topNText = providers.topN ? `topN=${providers.topN}` : '';
 
   ui.runMeta.textContent = [
     `${meta.label || 'Run'} (${run.run_id})`,
     `tokens=${run.tokens.length}`,
+    geometryText,
+    topNText,
     `temp=${formatNum(asNumber(settings.temperature), 2)}`,
     `top_p=${formatNum(asNumber(settings.top_p), 2)}`,
     `seed=${settings.seed ?? '-'}`,
     mutationText,
     latestText,
   ].filter(Boolean).join(' | ');
+}
+
+function explainRisk(token) {
+  const risk = asNumber(token?.decoder_risk);
+  if (risk == null) {
+    return {
+      label: 'No estimate',
+      meaning: 'This position has no decoder-side risk estimate yet.',
+    };
+  }
+  if (risk >= 0.7) {
+    return {
+      label: 'High',
+      meaning: 'The decoder is unstable here. This is a strong place to inspect whether the answer becomes unsupported.',
+    };
+  }
+  if (risk >= 0.45) {
+    return {
+      label: 'Medium',
+      meaning: 'Several decoder-side warning signs are active. Watch for drift, hedging, or abrupt topic shifts.',
+    };
+  }
+  return {
+    label: 'Low',
+    meaning: 'The decoder looks comparatively settled here. That still does not prove the claim is true.',
+  };
+}
+
+function reasonLabels(token) {
+  if (!token) return [];
+  const reasons = [];
+  if (asNumber(token.uncertainty) != null && token.uncertainty >= 0.72) reasons.push('many plausible next tokens');
+  if (asNumber(token.prob_gap) != null && token.prob_gap <= 0.12) reasons.push('top choices are too close');
+  if (asNumber(token.entropy_delta) != null && token.entropy_delta >= 0.38) reasons.push('uncertainty jumped sharply');
+  if (asNumber(token.repetition_pressure) != null && token.repetition_pressure >= 0.45) reasons.push('local repetition pressure is high');
+  return reasons;
+}
+
+function renderAudienceSummary() {
+  const run = currentRunA();
+  const token = run?.tokens?.[state.currentIndex];
+  if (!run || !token) {
+    ui.storyRisk.textContent = '-';
+    ui.storyReasons.textContent = '-';
+    ui.storyMeaning.textContent = 'Load or generate a run to get a plain-language explanation.';
+    return;
+  }
+
+  const risk = explainRisk(token);
+  const reasons = reasonLabels(token);
+  ui.storyRisk.textContent = `${risk.label} (${formatPercent(token.decoder_risk, 0)})`;
+  ui.storyReasons.textContent = reasons.length ? reasons.join(', ') : 'no strong decoder-side warning signs';
+  ui.storyMeaning.textContent = risk.meaning;
+}
+
+function renderBackendPanel() {
+  const info = state.backendInfo;
+  const run = currentRunA();
+  const providers = run?.meta?.providers || {};
+  const selectedGeometry = ui.vectorMode?.value || 'placeholder';
+  ui.backendReachable.textContent = info ? (info.reachable ? 'yes' : 'no') : 'not probed';
+  ui.backendModel.textContent = info?.model || run?.meta?.model || '-';
+  ui.backendProbs.textContent = info ? (info.token_probs ? 'yes' : info.completion ? 'no / weak' : '-') : (providers.topN || '-');
+  ui.backendEmbeddings.textContent = info ? (info.embedding ? 'yes' : 'no') : '-';
+  ui.backendGeometry.textContent = providers.embedding === 'real'
+    ? 'real embeddings'
+    : providers.embedding === 'placeholder'
+      ? 'placeholder vectors'
+      : selectedGeometry === 'real'
+        ? 'requested real embeddings'
+        : 'placeholder vectors';
 }
 
 function addOrUpdateRun(run, source = 'server') {
@@ -797,7 +1036,9 @@ function updateRunFromTokenEvent(runId, rawToken) {
   const token = normalizeToken(rawToken, run, index, prevVector);
   run.tokens.push(token);
   recomputeKinematics(run);
+  enrichDecoderDiagnostics(run);
   run.analysis.regime_markers = detectRegimeMarkers(run);
+  run.analysis.decoder_alerts = detectDecoderAlerts(run);
   run.summary.token_count = run.tokens.length;
 
   syncTimelineBounds();
@@ -883,10 +1124,11 @@ function displayTokenText(text) {
 function buildTokenTitle(token) {
   return [
     `index: ${token.index}`,
-    `logprob: ${formatNum(token.logprob)}`,
-    `entropy: ${formatNum(token.entropy)}`,
-    `margin: ${formatNum(token.margin)}`,
-    `velocity: ${formatNum(token.velocity)}`,
+    `risk: ${formatPercent(token.decoder_risk, 0)}`,
+    `uncertainty: ${formatPercent(token.uncertainty, 0)}`,
+    `gap: ${formatPercent(token.prob_gap, 0)}`,
+    `jump: ${formatNum(token.entropy_delta, 2)}`,
+    `repeat: ${formatPercent(token.repetition_pressure, 0)}`,
   ].join(' | ');
 }
 
@@ -1186,6 +1428,58 @@ function pca2(vectors) {
   return { mean, v1, v2 };
 }
 
+function pca3(vectors) {
+  if (!vectors.length) return null;
+
+  const d = vectors[0].length;
+  const mean = new Array(d).fill(0);
+  for (const v of vectors) {
+    for (let i = 0; i < d; i += 1) mean[i] += v[i];
+  }
+  for (let i = 0; i < d; i += 1) mean[i] /= vectors.length;
+
+  const cov = Array.from({ length: d }, () => new Array(d).fill(0));
+  for (const v of vectors) {
+    const centered = new Array(d);
+    for (let i = 0; i < d; i += 1) centered[i] = v[i] - mean[i];
+    for (let i = 0; i < d; i += 1) {
+      for (let j = i; j < d; j += 1) {
+        cov[i][j] += centered[i] * centered[j];
+      }
+    }
+  }
+
+  const scale = 1 / Math.max(1, vectors.length - 1);
+  for (let i = 0; i < d; i += 1) {
+    for (let j = i; j < d; j += 1) {
+      cov[i][j] *= scale;
+      cov[j][i] = cov[i][j];
+    }
+  }
+
+  const v1 = powerIteration(cov, Array.from({ length: d }, (_, i) => (i % 2 === 0 ? 1 : -1)), 72, []);
+  if (!v1) return null;
+  const lambda1 = dot(v1, matVec(cov, v1));
+  const deflated1 = Array.from({ length: d }, (_, i) =>
+    Array.from({ length: d }, (_, j) => cov[i][j] - lambda1 * v1[i] * v1[j])
+  );
+
+  const v2 = powerIteration(deflated1, Array.from({ length: d }, (_, i) => (i % 3 === 0 ? 1 : 0.4)), 72, [v1]);
+  if (!v2) return null;
+  const lambda2 = dot(v2, matVec(cov, v2));
+  const deflated2 = Array.from({ length: d }, (_, i) =>
+    Array.from({ length: d }, (_, j) => deflated1[i][j] - lambda2 * v2[i] * v2[j])
+  );
+
+  let v3 = powerIteration(deflated2, Array.from({ length: d }, (_, i) => (i % 4 === 0 ? -1 : 0.6)), 72, [v1, v2]);
+  if (!v3) {
+    v3 = new Array(d).fill(0);
+    v3[Math.min(2, d - 1)] = 1;
+  }
+
+  return { mean, v1, v2, v3 };
+}
+
 function projectPoints(vectors, basis) {
   const points = [];
   for (const v of vectors) {
@@ -1193,6 +1487,19 @@ function projectPoints(vectors, basis) {
     points.push({
       x: dot(centered, basis.v1),
       y: dot(centered, basis.v2),
+    });
+  }
+  return points;
+}
+
+function projectPoints3(vectors, basis) {
+  const points = [];
+  for (const v of vectors) {
+    const centered = v.map((x, i) => x - basis.mean[i]);
+    points.push({
+      x: dot(centered, basis.v1),
+      y: dot(centered, basis.v2),
+      z: dot(centered, basis.v3),
     });
   }
   return points;
@@ -1233,12 +1540,48 @@ function normalizePoints(points, bounds) {
   }));
 }
 
+function boundsFromPoints3(points) {
+  if (!points.length) {
+    return {
+      minX: 0, maxX: 1,
+      minY: 0, maxY: 1,
+      minZ: 0, maxZ: 1,
+    };
+  }
+  let minX = points[0].x;
+  let maxX = points[0].x;
+  let minY = points[0].y;
+  let maxY = points[0].y;
+  let minZ = points[0].z;
+  let maxZ = points[0].z;
+  for (const p of points) {
+    if (p.x < minX) minX = p.x;
+    if (p.x > maxX) maxX = p.x;
+    if (p.y < minY) minY = p.y;
+    if (p.y > maxY) maxY = p.y;
+    if (p.z < minZ) minZ = p.z;
+    if (p.z > maxZ) maxZ = p.z;
+  }
+  if (Math.abs(maxX - minX) < 1e-9) { minX -= 1; maxX += 1; }
+  if (Math.abs(maxY - minY) < 1e-9) { minY -= 1; maxY += 1; }
+  if (Math.abs(maxZ - minZ) < 1e-9) { minZ -= 1; maxZ += 1; }
+  return { minX, maxX, minY, maxY, minZ, maxZ };
+}
+
+function normalizePoints3(points, bounds) {
+  return points.map((p) => ({
+    x: (p.x - bounds.minX) / (bounds.maxX - bounds.minX),
+    y: (p.y - bounds.minY) / (bounds.maxY - bounds.minY),
+    z: (p.z - bounds.minZ) / (bounds.maxZ - bounds.minZ),
+  }));
+}
+
 function projectionKey(runA, runB) {
   if (!runA) return 'empty';
   if (!runB || !state.diffEnabled) {
-    return `single:${runA.run_id}:${runA.tokens.length}`;
+    return `${state.projectionMode}:single:${runA.run_id}:${runA.tokens.length}`;
   }
-  return `diff:${runA.run_id}:${runA.tokens.length}:${runB.run_id}:${runB.tokens.length}`;
+  return `${state.projectionMode}:diff:${runA.run_id}:${runA.tokens.length}:${runB.run_id}:${runB.tokens.length}`;
 }
 
 function getProjection(runA, runB) {
@@ -1257,6 +1600,27 @@ function getProjection(runA, runB) {
     return empty;
   }
 
+  if (state.projectionMode === '3d') {
+    const basis3 = pca3(combined);
+    if (!basis3) {
+      const empty = { pointsA: [], pointsB: [] };
+      state.projectionCache.set(key, empty);
+      return empty;
+    }
+    const rawA3 = projectPoints3(vectorsA, basis3);
+    const rawB3 = runB && state.diffEnabled ? projectPoints3(vectorsB, basis3) : [];
+    const bounds3 = boundsFromPoints3(rawA3.concat(rawB3));
+    const result3 = {
+      dims: 3,
+      pointsA: normalizePoints3(rawA3, bounds3),
+      pointsB: normalizePoints3(rawB3, bounds3),
+      bounds: bounds3,
+      basis: basis3,
+    };
+    state.projectionCache.set(key, result3);
+    return result3;
+  }
+
   const basis = pca2(combined);
   if (!basis) {
     const empty = { pointsA: [], pointsB: [] };
@@ -1269,6 +1633,7 @@ function getProjection(runA, runB) {
   const bounds = boundsFromPoints(rawA.concat(rawB));
 
   const result = {
+    dims: 2,
     pointsA: normalizePoints(rawA, bounds),
     pointsB: normalizePoints(rawB, bounds),
     bounds,
@@ -1291,10 +1656,7 @@ function alignRuns(runA, runB, pointsA, pointsB) {
 
   if (lenA === lenB) {
     for (let i = 0; i < lenA; i += 1) {
-      const d = vectorDistance(
-        [pointsA[i].x, pointsA[i].y],
-        [pointsB[i].x, pointsB[i].y]
-      ) || 0;
+      const d = pointDistance(pointsA[i], pointsB[i]) || 0;
       pairs.push({ a: i, b: i, distance: d });
       mapAtoB[i] = i;
     }
@@ -1318,10 +1680,7 @@ function alignRuns(runA, runB, pointsA, pointsB) {
     let bestDist = Infinity;
 
     for (let j = start; j <= end; j += 1) {
-      const dist = vectorDistance(
-        [pointsA[i].x, pointsA[i].y],
-        [pointsB[j].x, pointsB[j].y]
-      );
+      const dist = pointDistance(pointsA[i], pointsB[j]);
       if (dist != null && dist < bestDist) {
         bestDist = dist;
         bestJ = j;
@@ -1435,6 +1794,77 @@ function drawGrid(ctx, width, height, pad = 36) {
   ctx.restore();
 }
 
+function rotatePoint3(point, yaw, pitch) {
+  const cx = point.x - 0.5;
+  const cy = point.y - 0.5;
+  const cz = point.z - 0.5;
+
+  const cosY = Math.cos(yaw);
+  const sinY = Math.sin(yaw);
+  const x1 = cx * cosY - cz * sinY;
+  const z1 = cx * sinY + cz * cosY;
+
+  const cosX = Math.cos(pitch);
+  const sinX = Math.sin(pitch);
+  const y2 = cy * cosX - z1 * sinX;
+  const z2 = cy * sinX + z1 * cosX;
+
+  return { x: x1, y: y2, z: z2 };
+}
+
+function toCanvas3D(point, width, height) {
+  const rotated = rotatePoint3(point, state.view3d.yaw, state.view3d.pitch);
+  const dist = 1.95;
+  const scale = Math.min(width, height) * 0.78;
+  const perspective = 1 / (dist - rotated.z);
+  return {
+    x: width / 2 + rotated.x * scale * perspective,
+    y: height / 2 - rotated.y * scale * perspective,
+    depth: rotated.z,
+  };
+}
+
+function drawGrid3D(ctx, width, height) {
+  const corners = [
+    { x: 0, y: 0, z: 0 }, { x: 1, y: 0, z: 0 }, { x: 1, y: 1, z: 0 }, { x: 0, y: 1, z: 0 },
+    { x: 0, y: 0, z: 1 }, { x: 1, y: 0, z: 1 }, { x: 1, y: 1, z: 1 }, { x: 0, y: 1, z: 1 },
+  ].map((p) => toCanvas3D(p, width, height));
+  const edges = [
+    [0, 1], [1, 2], [2, 3], [3, 0],
+    [4, 5], [5, 6], [6, 7], [7, 4],
+    [0, 4], [1, 5], [2, 6], [3, 7],
+  ];
+
+  ctx.save();
+  ctx.strokeStyle = RUN_COLORS.grid;
+  ctx.lineWidth = 1;
+  for (const [a, b] of edges) {
+    ctx.beginPath();
+    ctx.moveTo(corners[a].x, corners[a].y);
+    ctx.lineTo(corners[b].x, corners[b].y);
+    ctx.stroke();
+  }
+
+  ctx.fillStyle = '#6a7786';
+  ctx.font = `${Math.max(11, Math.round(width * 0.012))}px "IBM Plex Mono"`;
+  const axisLabels = [
+    { from: { x: 0, y: 0, z: 0 }, to: { x: 1.1, y: 0, z: 0 }, label: 'PC1' },
+    { from: { x: 0, y: 0, z: 0 }, to: { x: 0, y: 1.1, z: 0 }, label: 'PC2' },
+    { from: { x: 0, y: 0, z: 0 }, to: { x: 0, y: 0, z: 1.1 }, label: 'PC3' },
+  ];
+  for (const axis of axisLabels) {
+    const a = toCanvas3D(axis.from, width, height);
+    const b = toCanvas3D(axis.to, width, height);
+    ctx.strokeStyle = RUN_COLORS.axis;
+    ctx.beginPath();
+    ctx.moveTo(a.x, a.y);
+    ctx.lineTo(b.x, b.y);
+    ctx.stroke();
+    ctx.fillText(axis.label, b.x + 4, b.y + 4);
+  }
+  ctx.restore();
+}
+
 function drawTrajectory(ctx, points, currentIndex, colorHex, markers = []) {
   if (!points.length) return;
 
@@ -1494,6 +1924,60 @@ function drawTrajectory(ctx, points, currentIndex, colorHex, markers = []) {
   ctx.restore();
 }
 
+function drawTrajectory3D(ctx, points, currentIndex, colorHex, markers = []) {
+  if (!points.length) return;
+
+  const width = ctx.canvas.width;
+  const height = ctx.canvas.height;
+  const projected = points.map((p) => toCanvas3D(p, width, height));
+
+  ctx.save();
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  ctx.lineWidth = 1.2;
+  ctx.strokeStyle = `${colorHex}44`;
+  ctx.beginPath();
+  ctx.moveTo(projected[0].x, projected[0].y);
+  for (let i = 1; i < projected.length; i += 1) {
+    ctx.lineTo(projected[i].x, projected[i].y);
+  }
+  ctx.stroke();
+
+  const end = clamp(currentIndex, 0, projected.length - 1);
+  ctx.lineWidth = 2.8;
+  ctx.strokeStyle = colorHex;
+  ctx.beginPath();
+  ctx.moveTo(projected[0].x, projected[0].y);
+  for (let i = 1; i <= end; i += 1) {
+    ctx.lineTo(projected[i].x, projected[i].y);
+  }
+  ctx.stroke();
+
+  for (const marker of markers) {
+    if (!marker || marker.index == null || marker.index < 0 || marker.index >= projected.length) continue;
+    const p = projected[marker.index];
+    ctx.strokeStyle = RUN_COLORS.marker;
+    ctx.lineWidth = 1.8;
+    ctx.beginPath();
+    ctx.moveTo(p.x - 5, p.y - 5);
+    ctx.lineTo(p.x + 5, p.y + 5);
+    ctx.moveTo(p.x + 5, p.y - 5);
+    ctx.lineTo(p.x - 5, p.y + 5);
+    ctx.stroke();
+  }
+
+  const active = projected[end];
+  ctx.fillStyle = colorHex;
+  ctx.beginPath();
+  ctx.arc(active.x, active.y, 5, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = '#ffffff';
+  ctx.beginPath();
+  ctx.arc(active.x, active.y, 2, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+}
+
 function drawDiffConnectors(ctx, pointsA, pointsB, alignment, currentIndex) {
   if (!alignment || !pointsA.length || !pointsB.length) return;
   const width = ctx.canvas.width;
@@ -1532,6 +2016,43 @@ function drawDiffConnectors(ctx, pointsA, pointsB, alignment, currentIndex) {
   ctx.restore();
 }
 
+function drawDiffConnectors3D(ctx, pointsA, pointsB, alignment, currentIndex) {
+  if (!alignment || !pointsA.length || !pointsB.length) return;
+  const width = ctx.canvas.width;
+  const height = ctx.canvas.height;
+
+  ctx.save();
+  ctx.strokeStyle = 'rgba(112, 126, 144, 0.25)';
+  ctx.lineWidth = 1;
+  ctx.setLineDash([3, 4]);
+
+  for (let i = 0; i < alignment.pairs.length; i += 6) {
+    const pair = alignment.pairs[i];
+    const a = toCanvas3D(pointsA[pair.a], width, height);
+    const b = toCanvas3D(pointsB[pair.b], width, height);
+    ctx.beginPath();
+    ctx.moveTo(a.x, a.y);
+    ctx.lineTo(b.x, b.y);
+    ctx.stroke();
+  }
+
+  const idxA = clamp(currentIndex, 0, alignment.pairs.length - 1);
+  const pair = alignment.pairs[idxA];
+  if (pair) {
+    const a = toCanvas3D(pointsA[pair.a], width, height);
+    const b = toCanvas3D(pointsB[pair.b], width, height);
+    ctx.setLineDash([]);
+    ctx.strokeStyle = 'rgba(194, 70, 59, 0.75)';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(a.x, a.y);
+    ctx.lineTo(b.x, b.y);
+    ctx.stroke();
+  }
+
+  ctx.restore();
+}
+
 function drawSnakeCanvas() {
   const runA = currentRunA();
   const runB = currentRunB();
@@ -1542,7 +2063,11 @@ function drawSnakeCanvas() {
   const height = ui.snakeCanvas.height;
 
   ctx.clearRect(0, 0, width, height);
-  drawGrid(ctx, width, height);
+  if (state.projectionMode === '3d') {
+    drawGrid3D(ctx, width, height);
+  } else {
+    drawGrid(ctx, width, height);
+  }
 
   if (!runA || !runA.tokens.length) {
     ctx.fillStyle = '#5d7084';
@@ -1556,14 +2081,24 @@ function drawSnakeCanvas() {
   }
 
   const projection = getProjection(runA, runB);
-  const markersA = runA.analysis?.regime_markers || [];
+  const markersA = runA.analysis?.decoder_alerts || [];
 
-  drawTrajectory(ctx, projection.pointsA, state.currentIndex, RUN_COLORS.a, markersA);
+  if (state.projectionMode === '3d') {
+    drawTrajectory3D(ctx, projection.pointsA, state.currentIndex, RUN_COLORS.a, markersA);
+  } else {
+    drawTrajectory(ctx, projection.pointsA, state.currentIndex, RUN_COLORS.a, markersA);
+  }
 
   if (runB && state.diffEnabled) {
     const diff = computeDiffContext();
-    drawTrajectory(ctx, projection.pointsB, diff?.mapAtoB?.[state.currentIndex] ?? state.currentIndex, RUN_COLORS.b, runB.analysis?.regime_markers || []);
-    drawDiffConnectors(ctx, projection.pointsA, projection.pointsB, diff, state.currentIndex);
+    const runBMarkers = runB.analysis?.decoder_alerts || [];
+    if (state.projectionMode === '3d') {
+      drawTrajectory3D(ctx, projection.pointsB, diff?.mapAtoB?.[state.currentIndex] ?? state.currentIndex, RUN_COLORS.b, runBMarkers);
+      drawDiffConnectors3D(ctx, projection.pointsA, projection.pointsB, diff, state.currentIndex);
+    } else {
+      drawTrajectory(ctx, projection.pointsB, diff?.mapAtoB?.[state.currentIndex] ?? state.currentIndex, RUN_COLORS.b, runBMarkers);
+      drawDiffConnectors(ctx, projection.pointsA, projection.pointsB, diff, state.currentIndex);
+    }
   }
 }
 
@@ -1630,7 +2165,7 @@ function drawMetricGraph(canvas, key, runA, runB, mapAtoB) {
   drawSeries(valuesA, RUN_COLORS.a);
   drawSeries(valuesB, RUN_COLORS.b);
 
-  const markers = runA.analysis?.regime_markers || [];
+  const markers = runA.analysis?.decoder_alerts || [];
   ctx.strokeStyle = 'rgba(194, 70, 59, 0.55)';
   ctx.lineWidth = 1;
   ctx.setLineDash([3, 3]);
@@ -1674,10 +2209,12 @@ function drawMetrics() {
   const runB = currentRunB();
   const diff = runA && runB && state.diffEnabled ? computeDiffContext() : null;
 
-  drawMetricGraph(ui.metricEntropy, 'entropy', runA, runB, diff?.mapAtoB);
-  drawMetricGraph(ui.metricMargin, 'margin', runA, runB, diff?.mapAtoB);
+  drawMetricGraph(ui.metricUncertainty, 'uncertainty', runA, runB, diff?.mapAtoB);
+  drawMetricGraph(ui.metricGap, 'prob_gap', runA, runB, diff?.mapAtoB);
+  drawMetricGraph(ui.metricJump, 'entropy_delta', runA, runB, diff?.mapAtoB);
+  drawMetricGraph(ui.metricRepeat, 'repetition_pressure', runA, runB, diff?.mapAtoB);
+  drawMetricGraph(ui.metricRisk, 'decoder_risk', runA, runB, diff?.mapAtoB);
   drawMetricGraph(ui.metricVelocity, 'velocity', runA, runB, diff?.mapAtoB);
-  drawMetricGraph(ui.metricCurvature, 'curvature', runA, runB, diff?.mapAtoB);
 }
 
 function renderDiffSummary() {
@@ -1725,7 +2262,7 @@ function openTokenPopup(runId, tokenIndex) {
 
   ui.popup.classList.remove('hidden');
   ui.popupTitle.textContent = `Token #${tokenIndex}: ${displayTokenText(token.text)}`;
-  ui.popupMeta.textContent = `logprob ${formatNum(token.logprob)} | entropy ${formatNum(token.entropy)} | margin ${formatNum(token.margin)}`;
+  ui.popupMeta.textContent = `risk ${formatPercent(token.decoder_risk, 0)} | uncertainty ${formatPercent(token.uncertainty, 0)} | gap ${formatPercent(token.prob_gap, 0)} | repeat ${formatPercent(token.repetition_pressure, 0)}`;
 
   renderPopupAlternatives();
 }
@@ -1830,6 +2367,15 @@ async function refreshRunsFromServer() {
   try {
     const status = await apiGet('/api/status');
     state.serverRunning = Boolean(status.running);
+    const defaults = status?.defaults || {};
+    if (defaults.base_url && !ui.endpoint.dataset.hydrated) {
+      ui.endpoint.value = String(defaults.base_url);
+      ui.endpoint.dataset.hydrated = '1';
+    }
+    if (defaults.vector_mode && !ui.vectorMode.dataset.hydrated) {
+      ui.vectorMode.value = String(defaults.vector_mode);
+      ui.vectorMode.dataset.hydrated = '1';
+    }
 
     const data = await apiGet('/api/runs');
     const summaries = Array.isArray(data.runs) ? data.runs : [];
@@ -1850,9 +2396,42 @@ async function refreshRunsFromServer() {
     renderRunSelectors();
     syncTimelineBounds();
     updateRunMeta();
+    renderBackendPanel();
     state.needsRender = true;
   } catch {
     // Server can be unavailable while booting; keep UI responsive.
+  }
+}
+
+async function probeBackend() {
+  const baseUrl = normalizeBaseUrl(ui.endpoint.value);
+  if (!baseUrl) {
+    setStatus('Endpoint is invalid.', 'error');
+    return;
+  }
+  ui.endpoint.value = baseUrl;
+  try {
+    setStatus('Probing backend...', 'neutral');
+    const response = await apiPost('/api/backend-info', { base_url: baseUrl });
+    state.backendInfo = response?.backend || null;
+    renderBackendPanel();
+    if (state.backendInfo?.reachable) {
+      setStatus(`Backend ready: ${state.backendInfo.model || baseUrl}`, 'success');
+    } else {
+      setStatus(`Backend probe failed: ${state.backendInfo?.error || 'unreachable'}`, 'error');
+    }
+  } catch (err) {
+    state.backendInfo = {
+      base_url: baseUrl,
+      reachable: false,
+      completion: false,
+      token_probs: false,
+      embedding: false,
+      model: null,
+      error: err.message,
+    };
+    renderBackendPanel();
+    setStatus(`Probe failed: ${err.message}`, 'error');
   }
 }
 
@@ -1940,7 +2519,7 @@ async function startGeneration() {
     max_tokens: asNumber(ui.maxTokens.value, 256),
     top_n: 5,
     n_probs: 20,
-    vector_mode: 'placeholder',
+    vector_mode: ui.vectorMode.value || 'placeholder',
     vector_dim: 24,
   };
 
@@ -2095,6 +2674,8 @@ function updatePlayback(ts) {
 
 function renderAll() {
   updateRunMeta();
+  renderAudienceSummary();
+  renderBackendPanel();
   renderDiffSummary();
   drawSnakeCanvas();
   drawMetrics();
@@ -2112,6 +2693,7 @@ function onFrame(ts) {
 
 function bindUI() {
   ui.generateBtn.addEventListener('click', startGeneration);
+  ui.probeBackendBtn.addEventListener('click', probeBackend);
   ui.stopBtn.addEventListener('click', stopGeneration);
   ui.exportBtn.addEventListener('click', exportRunA);
 
@@ -2128,6 +2710,15 @@ function bindUI() {
     if (normalized) {
       ui.endpoint.value = normalized;
     }
+  });
+
+  ui.projectionMode.addEventListener('change', () => {
+    state.projectionMode = ui.projectionMode.value || '2d';
+    state.needsRender = true;
+  });
+
+  ui.vectorMode.addEventListener('change', () => {
+    renderBackendPanel();
   });
 
   ui.runASelect.addEventListener('change', async () => {
@@ -2187,6 +2778,35 @@ function bindUI() {
   ui.timeline.addEventListener('input', () => {
     setCurrentIndex(asNumber(ui.timeline.value, 0));
   });
+
+  ui.snakeCanvas.addEventListener('pointerdown', (event) => {
+    if (state.projectionMode !== '3d') return;
+    state.view3d.dragging = true;
+    state.view3d.lastX = event.clientX;
+    state.view3d.lastY = event.clientY;
+    ui.snakeCanvas.setPointerCapture(event.pointerId);
+  });
+
+  ui.snakeCanvas.addEventListener('pointermove', (event) => {
+    if (state.projectionMode !== '3d' || !state.view3d.dragging) return;
+    const dx = event.clientX - state.view3d.lastX;
+    const dy = event.clientY - state.view3d.lastY;
+    state.view3d.lastX = event.clientX;
+    state.view3d.lastY = event.clientY;
+    state.view3d.yaw += dx * 0.01;
+    state.view3d.pitch = clamp(state.view3d.pitch - dy * 0.01, -1.25, 1.25);
+    state.needsRender = true;
+  });
+
+  const release3dDrag = (event) => {
+    if (state.projectionMode !== '3d') return;
+    state.view3d.dragging = false;
+    if (event?.pointerId != null && ui.snakeCanvas.hasPointerCapture?.(event.pointerId)) {
+      ui.snakeCanvas.releasePointerCapture(event.pointerId);
+    }
+  };
+  ui.snakeCanvas.addEventListener('pointerup', release3dDrag);
+  ui.snakeCanvas.addEventListener('pointercancel', release3dDrag);
 
   ui.bookmarkBtn.addEventListener('click', addBookmark);
 
@@ -2259,11 +2879,14 @@ async function bootstrap() {
   await refreshRunsFromServer();
 
   const status = await apiGet('/api/status').catch(() => null);
+  if (status?.defaults?.base_url) ui.endpoint.value = String(status.defaults.base_url);
+  if (status?.defaults?.vector_mode) ui.vectorMode.value = String(status.defaults.vector_mode);
   if (status?.running) {
     setStatus('Server running.', 'success');
   } else {
     setStatus('Idle', 'neutral');
   }
+  await probeBackend().catch(() => null);
 
   state.lastFrameTs = performance.now();
   requestAnimationFrame(onFrame);

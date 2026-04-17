@@ -1,6 +1,8 @@
 # Runtime artifacts
 *.pid
 *.log
+__pycache__/
+*.pyc
 
 # Visualizer-specific runtime files
 .viz_server.pid

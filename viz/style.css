@@ -71,7 +71,7 @@ body {
 
 #generation-grid {
   display: grid;
-  grid-template-columns: 1.6fr 2.4fr repeat(4, minmax(0, 0.9fr));
+  grid-template-columns: 1.5fr 2.2fr repeat(5, minmax(0, 0.85fr));
   gap: 10px;
   align-items: start;
 }
@@ -236,10 +236,17 @@ kbd {
   height: 420px;
   border: 1px solid var(--panel-border);
   border-radius: 10px;
+  touch-action: none;
   background:
     linear-gradient(180deg, #ffffff, #f8fbff),
     repeating-linear-gradient(0deg, transparent, transparent 22px, var(--bg-grid) 23px),
     repeating-linear-gradient(90deg, transparent, transparent 22px, var(--bg-grid) 23px);
+}
+
+#canvas-footnote,
+#metrics-note {
+  font-size: 12px;
+  color: var(--muted);
 }
 
 #timeline-row {
@@ -263,8 +270,8 @@ kbd {
 
 #inspector-panel {
   padding: 12px;
-  display: grid;
-  grid-template-rows: auto auto auto minmax(0, 1fr);
+  display: flex;
+  flex-direction: column;
   gap: 10px;
   min-height: 0;
 }
@@ -295,6 +302,17 @@ kbd {
 .kv strong {
   color: var(--text);
   font-family: 'IBM Plex Mono', ui-monospace, monospace;
+}
+
+.kv.multiline {
+  align-items: flex-start;
+}
+
+.kv.multiline strong {
+  text-align: right;
+  max-width: 70%;
+  white-space: normal;
+  line-height: 1.45;
 }
 
 .subpanel-head {
@@ -472,7 +490,7 @@ kbd {
 .metric-grid {
   margin-top: 8px;
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 10px;
 }
 
@@ -488,6 +506,14 @@ kbd {
   font-family: 'Fraunces', serif;
   font-size: 15px;
   font-weight: 650;
+}
+
+.metric-card p {
+  margin: 0 0 8px;
+  min-height: 34px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.4;
 }
 
 .metric-card canvas {
@@ -592,13 +618,12 @@ kbd {
     grid-template-columns: 1fr;
   }
 
-  #inspector-panel {
-    grid-template-columns: repeat(4, minmax(0, 1fr));
-    grid-template-rows: auto;
-  }
-
   #token-panel {
     min-height: 260px;
+  }
+
+  .metric-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
 
@@ -622,10 +647,6 @@ kbd {
   }
 
   .metric-grid {
-    grid-template-columns: 1fr;
-  }
-
-  #inspector-panel {
     grid-template-columns: 1fr;
   }
 }

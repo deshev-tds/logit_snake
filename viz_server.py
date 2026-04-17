@@ -176,6 +176,21 @@ def compute_entropy_margin(topn):
     return entropy, margin
 
 
+def observed_mass(topn):
+    if not topn:
+        return None
+    mass = sum(max(0.0, float(item.get("prob") or 0.0)) for item in topn)
+    return max(0.0, min(1.0, mass))
+
+
+def top_prob_gap(topn):
+    if not topn:
+        return None, None, None
+    top1 = max(0.0, float(topn[0].get("prob") or 0.0))
+    top2 = max(0.0, float(topn[1].get("prob") or 0.0)) if len(topn) > 1 else 0.0
+    return top1, top2, max(0.0, top1 - top2)
+
+
 def l2(a, b):
     if a is None or b is None or len(a) != len(b):
         return None
@@ -221,6 +236,12 @@ def tokenize_fallback(text):
         return []
     parts = re.findall(r"\s+|[^\s]+", text, flags=re.UNICODE)
     return parts or [text]
+
+
+def normalize_repeat_token(text):
+    raw = str(text or "")
+    compact = re.sub(r"\s+", " ", raw).strip().lower()
+    return compact or raw.strip().lower() or raw.lower()
 
 
 def synthetic_topn(chosen_text, chosen_id, seed_value, n=5):
@@ -595,6 +616,68 @@ def recompute_kinematics(tokens):
         prev_delta = delta
 
 
+def enrich_decoder_diagnostics(tokens):
+    previous_entropy = None
+    seen_norm_tokens = []
+    seen_bigrams = []
+
+    for token in tokens:
+        topn = token.get("topN") or []
+        top1_prob, top2_prob, prob_gap = top_prob_gap(topn)
+        mass = observed_mass(topn)
+        entropy = token.get("entropy")
+
+        if entropy is None:
+            uncertainty = None
+        else:
+            denom = math.log(max(2, len(topn) + 1))
+            uncertainty = max(0.0, min(1.0, float(entropy) / denom)) if denom > 0 else None
+
+        entropy_delta = None
+        if entropy is not None and previous_entropy is not None:
+            entropy_delta = abs(float(entropy) - previous_entropy)
+        previous_entropy = float(entropy) if entropy is not None else previous_entropy
+
+        curr_norm = normalize_repeat_token(token.get("text") or token.get("chosen_token_text") or "")
+        lookback_tokens = seen_norm_tokens[-12:]
+        unigram_hits = sum(1 for item in lookback_tokens if item and item == curr_norm)
+        repeat_unigram = (unigram_hits / len(lookback_tokens)) if lookback_tokens else 0.0
+
+        prev_norm = seen_norm_tokens[-1] if seen_norm_tokens else ""
+        current_bigram = f"{prev_norm}|{curr_norm}" if prev_norm or curr_norm else ""
+        bigram_hits = sum(1 for item in seen_bigrams[-12:] if item and item == current_bigram)
+        repeat_bigram = 1.0 if bigram_hits > 0 else 0.0
+
+        repetition_pressure = max(0.0, min(1.0, 0.6 * repeat_unigram + 0.4 * repeat_bigram))
+        gap_risk = None if prob_gap is None else max(0.0, min(1.0, 1.0 - prob_gap))
+        volatility = None if entropy_delta is None else max(0.0, min(1.0, entropy_delta / 0.75))
+
+        if any(x is not None for x in (uncertainty, gap_risk, volatility)):
+            base = (
+                0.38 * (uncertainty or 0.0)
+                + 0.24 * (gap_risk or 0.0)
+                + 0.22 * (volatility or 0.0)
+                + 0.16 * repetition_pressure
+            )
+            decoder_risk = max(0.0, min(1.0, base))
+        else:
+            decoder_risk = None
+
+        token["observed_mass"] = mass
+        token["top1_prob"] = top1_prob
+        token["top2_prob"] = top2_prob
+        token["prob_gap"] = prob_gap
+        token["uncertainty"] = uncertainty
+        token["entropy_delta"] = entropy_delta
+        token["repeat_unigram"] = repeat_unigram
+        token["repeat_bigram"] = repeat_bigram
+        token["repetition_pressure"] = repetition_pressure
+        token["decoder_risk"] = decoder_risk
+
+        seen_norm_tokens.append(curr_norm)
+        seen_bigrams.append(current_bigram)
+
+
 def detect_regime_markers(tokens):
     if len(tokens) < 4:
         return []
@@ -632,6 +715,32 @@ def detect_regime_markers(tokens):
     return markers
 
 
+def detect_decoder_alerts(tokens):
+    alerts = []
+    last_idx = -10
+    for i, token in enumerate(tokens):
+        reasons = []
+        uncertainty = token.get("uncertainty")
+        prob_gap = token.get("prob_gap")
+        entropy_delta = token.get("entropy_delta")
+        repetition_pressure = token.get("repetition_pressure")
+        decoder_risk = token.get("decoder_risk")
+
+        if uncertainty is not None and uncertainty >= 0.72:
+            reasons.append("high_uncertainty")
+        if prob_gap is not None and prob_gap <= 0.12:
+            reasons.append("weak_choice_gap")
+        if entropy_delta is not None and entropy_delta >= 0.38:
+            reasons.append("uncertainty_jump")
+        if repetition_pressure is not None and repetition_pressure >= 0.45:
+            reasons.append("repetition_pressure")
+
+        if decoder_risk is not None and decoder_risk >= 0.64 and i - last_idx >= 3:
+            alerts.append({"index": i, "risk": decoder_risk, "reasons": reasons or ["decoder_risk"]})
+            last_idx = i
+    return alerts
+
+
 def run_summary(run):
     meta = run.get("meta", {})
     branch = meta.get("branch") or {}
@@ -648,6 +757,7 @@ def run_summary(run):
         "parent_run_id": branch.get("parent_run_id"),
         "fork_index": branch.get("fork_index"),
         "mutation_count": len(branch_history),
+        "providers": meta.get("providers"),
     }
 
 
@@ -748,6 +858,66 @@ def fetch_model_name(base_url):
     return None
 
 
+def has_embedding_support(base_url):
+    try:
+        resp = http_post_json(build_url(base_url, "/embedding"), {"content": "probe"}, timeout=8)
+    except Exception:
+        return False
+    if isinstance(resp, dict):
+        if isinstance(resp.get("embedding"), list):
+            return True
+        data = resp.get("data")
+        if isinstance(data, list) and data:
+            first = data[0]
+            if isinstance(first, dict) and isinstance(first.get("embedding"), list):
+                return True
+    return False
+
+
+def probe_backend(base_url):
+    info = {
+        "base_url": base_url,
+        "reachable": False,
+        "completion": False,
+        "token_probs": False,
+        "embedding": False,
+        "model": fetch_model_name(base_url),
+        "error": None,
+    }
+
+    payload = {
+        "prompt": "Probe:",
+        "n_predict": 1,
+        "n_probs": 5,
+        "return_tokens": True,
+        "stream": False,
+        "cache_prompt": False,
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "seed": 0,
+        "id_slot": DEFAULTS.get("id_slot", 0),
+    }
+    if info["model"]:
+        payload["model"] = info["model"]
+
+    try:
+        resp = http_post_json(build_url(base_url, "/completion"), payload, timeout=12)
+        info["reachable"] = True
+        info["completion"] = True
+        info["token_probs"] = bool(extract_probs(resp))
+    except Exception as err:
+        info["error"] = str(err)
+
+    try:
+        info["embedding"] = has_embedding_support(base_url)
+        if info["embedding"]:
+            info["reachable"] = True
+    except Exception:
+        pass
+
+    return info
+
+
 def sanitize_settings(raw_settings):
     raw_settings = raw_settings if isinstance(raw_settings, dict) else {}
     settings = {
@@ -811,6 +981,7 @@ def create_run_object(
         },
         "analysis": {
             "regime_markers": [],
+            "decoder_alerts": [],
         },
         "summary": {},
     }
@@ -889,6 +1060,9 @@ def initialize_prefill_tokens(run):
         history_text.append(text)
 
     recompute_kinematics(tokens)
+    enrich_decoder_diagnostics(tokens)
+    run.setdefault("meta", {}).setdefault("providers", {})
+    run["meta"]["providers"]["embedding"] = provider.mode
 
 
 def run_worker(run_id, stop_event):
@@ -979,6 +1153,10 @@ def run_worker(run_id, stop_event):
 
                     generated_text += token_text
                     history_text.append(token_text)
+                    with RUNS_LOCK:
+                        live_run = RUNS.get(run_id)
+                        if live_run is not None:
+                            live_run["meta"]["providers"]["embedding"] = vector_provider.mode
 
                     append_token(run_id, token)
                     token_index += 1
@@ -994,6 +1172,10 @@ def run_worker(run_id, stop_event):
                     token["embedding"] = vector_provider.vector_for(token_index, token.get("chosen_token_id"), raw_token, history_text)
                     generated_text += raw_token
                     history_text.append(raw_token)
+                    with RUNS_LOCK:
+                        live_run = RUNS.get(run_id)
+                        if live_run is not None:
+                            live_run["meta"]["providers"]["embedding"] = vector_provider.mode
 
                     append_token(run_id, token)
                     token_index += 1
@@ -1019,16 +1201,21 @@ def run_worker(run_id, stop_event):
             final_run = RUNS.get(run_id)
             if final_run is not None:
                 recompute_kinematics(final_run["tokens"])
+                enrich_decoder_diagnostics(final_run["tokens"])
                 final_run["analysis"]["regime_markers"] = detect_regime_markers(final_run["tokens"])
+                final_run["analysis"]["decoder_alerts"] = detect_decoder_alerts(final_run["tokens"])
                 final_run["meta"]["status"] = "stopped" if stop_event.is_set() else "complete"
                 final_run["meta"]["completed_at"] = utc_now_iso()
 
                 entropies = [t.get("entropy") for t in final_run["tokens"] if t.get("entropy") is not None]
                 velocities = [t.get("velocity") for t in final_run["tokens"] if t.get("velocity") is not None]
+                risks = [t.get("decoder_risk") for t in final_run["tokens"] if t.get("decoder_risk") is not None]
                 final_run["summary"] = {
                     "token_count": len(final_run["tokens"]),
                     "entropy_avg": (sum(entropies) / len(entropies)) if entropies else None,
                     "velocity_max": max(velocities) if velocities else None,
+                    "decoder_risk_max": max(risks) if risks else None,
+                    "decoder_alert_count": len(final_run["analysis"]["decoder_alerts"]),
                     "duration_ms": int((time.monotonic() - started) * 1000),
                 }
     except Exception as err:
@@ -1240,6 +1427,12 @@ class TelemetryHandler(SimpleHTTPRequestHandler):
     def log_message(self, fmt, *args):
         sys.stderr.write("%s - - [%s] %s\n" % (self.client_address[0], self.log_date_time_string(), fmt % args))
 
+    def handle_one_request(self):
+        try:
+            super().handle_one_request()
+        except (BrokenPipeError, ConnectionResetError):
+            return
+
     def do_GET(self):
         path = urlparse(self.path).path
 
@@ -1279,7 +1472,15 @@ class TelemetryHandler(SimpleHTTPRequestHandler):
             with GEN_LOCK:
                 running = bool(GEN_THREAD and GEN_THREAD.is_alive())
                 active_run_id = GEN_RUN_ID
-            send_json(self, 200, {"running": running, "active_run_id": active_run_id})
+            send_json(
+                self,
+                200,
+                {
+                    "running": running,
+                    "active_run_id": active_run_id,
+                    "defaults": copy.deepcopy(DEFAULTS),
+                },
+            )
             return
 
         if path == "/api/runs":
@@ -1310,6 +1511,16 @@ class TelemetryHandler(SimpleHTTPRequestHandler):
         if path == "/api/stop":
             stop_generation()
             send_json(self, 200, {"status": "stopped"})
+            return
+
+        if path == "/api/backend-info":
+            raw_base_url = body.get("base_url") or DEFAULTS["base_url"]
+            try:
+                base_url = normalize_base_url(raw_base_url)
+            except ValueError:
+                send_json(self, 400, {"error": "base_url is invalid"})
+                return
+            send_json(self, 200, {"backend": probe_backend(base_url)})
             return
 
         if path in ("/api/start", "/api/generate"):
@@ -1365,6 +1576,7 @@ class TelemetryHandler(SimpleHTTPRequestHandler):
             run_copy.setdefault("summary", {})
             initialize_prefill_tokens(run_copy)
             run_copy["analysis"]["regime_markers"] = detect_regime_markers(run_copy["tokens"])
+            run_copy["analysis"]["decoder_alerts"] = detect_decoder_alerts(run_copy["tokens"])
             run_copy["summary"]["token_count"] = len(run_copy["tokens"])
 
             with RUNS_LOCK:

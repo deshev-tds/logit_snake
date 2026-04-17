@@ -11,7 +11,7 @@
     <header id="topbar" class="panel">
       <div class="title-wrap">
         <h1>LLM Snake Scope</h1>
-        <p>2D trajectory replay, regime shifts, token alternatives, and branch diffs.</p>
+        <p>Explain where the decoder gets shaky, repetitive, or unsupported, without pretending uncertainty is factuality.</p>
       </div>
       <div id="generation-grid">
         <label>Endpoint
@@ -32,9 +32,16 @@
         <label>Max Tokens
           <input id="max-tokens-input" type="number" min="1" max="4096" value="256" />
         </label>
+        <label>Geometry Source
+          <select id="vector-mode-select">
+            <option value="placeholder" selected>Placeholder</option>
+            <option value="real">Real Embeddings</option>
+          </select>
+        </label>
       </div>
       <div id="action-row">
         <button id="generate-btn" class="accent">Generate Run</button>
+        <button id="probe-backend-btn">Probe Backend</button>
         <button id="stop-btn">Stop</button>
         <button id="load-file-btn">Load Run JSON</button>
         <button id="export-btn">Export Run A</button>
@@ -60,6 +67,12 @@
             <label>Run B
               <select id="run-b-select"></select>
             </label>
+            <label>Projection
+              <select id="projection-mode-select">
+                <option value="2d" selected>2D PCA</option>
+                <option value="3d">3D Orbit</option>
+              </select>
+            </label>
             <label class="checkbox-row">
               <input type="checkbox" id="diff-toggle" />
               Diff Overlay
@@ -70,6 +83,7 @@
           </div>
         </div>
         <canvas id="snake-canvas"></canvas>
+        <div id="canvas-footnote">Red markers are decoder alerts, not proof that hallucination has started. Drag to rotate in 3D mode.</div>
         <div id="timeline-row">
           <button id="play-btn" class="accent">Play</button>
           <button id="step-back-btn">Step -1</button>
@@ -92,8 +106,24 @@
       </section>
 
       <aside id="inspector-panel" class="panel">
+        <section class="subpanel" id="story-panel">
+          <h3>Audience Summary</h3>
+          <div class="kv"><span>Current Risk</span><strong id="story-risk">-</strong></div>
+          <div class="kv multiline"><span>Why Now</span><strong id="story-reasons">-</strong></div>
+          <div class="kv multiline"><span>What To Say</span><strong id="story-meaning">-</strong></div>
+        </section>
+
+        <section class="subpanel" id="backend-panel">
+          <h3>Backend & Provenance</h3>
+          <div class="kv"><span>Reachable</span><strong id="backend-reachable">-</strong></div>
+          <div class="kv"><span>Model</span><strong id="backend-model">-</strong></div>
+          <div class="kv"><span>Token Probs</span><strong id="backend-probs">-</strong></div>
+          <div class="kv"><span>Embeddings</span><strong id="backend-embeddings">-</strong></div>
+          <div class="kv"><span>Geometry</span><strong id="backend-geometry">-</strong></div>
+        </section>
+
         <section class="subpanel" id="diff-panel">
-          <h3>Diff Summary</h3>
+          <h3>Run Comparison</h3>
           <div class="kv"><span>Avg Distance</span><strong id="diff-avg">-</strong></div>
           <div class="kv"><span>Max Spike</span><strong id="diff-max">-</strong></div>
           <div class="kv"><span>First Shift</span><strong id="diff-first">-</strong></div>
@@ -124,12 +154,15 @@
     </main>
 
     <section id="metrics-panel" class="panel">
-      <h2>Metrics Over Time</h2>
+      <h2>Decoder Diagnostics Over Time</h2>
+      <p id="metrics-note">These plots show decoder-side risk signals. They help you decide where to inspect, not whether a claim is true.</p>
       <div class="metric-grid">
-        <div class="metric-card"><h4>Entropy</h4><canvas id="metric-entropy"></canvas></div>
-        <div class="metric-card"><h4>Logit Margin</h4><canvas id="metric-margin"></canvas></div>
-        <div class="metric-card"><h4>Embedding Velocity</h4><canvas id="metric-velocity"></canvas></div>
-        <div class="metric-card"><h4>Curvature Proxy</h4><canvas id="metric-curvature"></canvas></div>
+        <div class="metric-card"><h4>Choice Uncertainty</h4><p>Entropy normalized over the observed next-token distribution.</p><canvas id="metric-uncertainty"></canvas></div>
+        <div class="metric-card"><h4>Choice Gap</h4><p>Probability gap between the best and second-best next token.</p><canvas id="metric-gap"></canvas></div>
+        <div class="metric-card"><h4>Uncertainty Jump</h4><p>How sharply uncertainty changed from the previous token.</p><canvas id="metric-jump"></canvas></div>
+        <div class="metric-card"><h4>Repetition Pressure</h4><p>Local token and bigram reuse that often precedes loops or drift.</p><canvas id="metric-repeat"></canvas></div>
+        <div class="metric-card"><h4>Decoder Risk</h4><p>A transparent blend of uncertainty, weak choice gap, volatility, and repetition.</p><canvas id="metric-risk"></canvas></div>
+        <div class="metric-card"><h4>Geometry Motion</h4><p>Movement in projection space. Useful visually, but only trustworthy with real embeddings.</p><canvas id="metric-velocity"></canvas></div>
       </div>
     </section>
   </div>
