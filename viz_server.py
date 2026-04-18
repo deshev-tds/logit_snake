@@ -604,6 +604,13 @@ def token_record_fallback(token_text, topn_n, prompt_hash, token_index, t_ms):
     }
 
 
+def prefill_tokens_from_text(text, prompt_hash, topn_n):
+    tokens = []
+    for idx, part in enumerate(tokenize_fallback(text)):
+        tokens.append(token_record_fallback(part, topn_n, prompt_hash, idx, 0))
+    return tokens
+
+
 def recompute_kinematics(tokens):
     prev_vec = None
     prev_delta = None
@@ -1607,7 +1614,17 @@ def heuristic_claim_probe_plan(claim, max_facts):
     }
 
 
-def build_claim_probe_plan(base_url, model_name, settings, claim, context_text, policy):
+def build_claim_probe_plan(base_url, model_name, settings, claim, context_text, policy, progress_cb=None, progress_context=None):
+    context = dict(progress_context or {})
+
+    def emit(stage, **extra):
+        if progress_cb is None:
+            return
+        payload = dict(context)
+        payload.update(extra)
+        payload["stage"] = stage
+        progress_cb(payload)
+
     prompt = (
         "You are preparing factual probes for a generated claim.\n"
         "Return JSON only with this schema:\n"
@@ -1628,6 +1645,7 @@ def build_claim_probe_plan(base_url, model_name, settings, claim, context_text, 
     probe_settings["top_p"] = 0.9
     probe_settings["seed"] = stable_seed(prompt, probe_settings.get("seed", 0), "claim-plan")
     probe_settings["id_slot"] = probe_slot_for_settings(settings, 1)
+    emit("plan_started", claim_text=claim)
     raw_text, used_model = completion_text_with_retry(
         base_url,
         prompt,
@@ -1661,17 +1679,39 @@ def build_claim_probe_plan(base_url, model_name, settings, claim, context_text, 
         "raw_response": raw_text,
         "model": used_model,
     }
+    emit(
+        "plan_ready",
+        claim_text=standalone_claim,
+        checkworthy=plan["checkworthy"],
+        facts_count=len(clean_facts),
+    )
     if not plan["facts"]:
         fallback = heuristic_claim_probe_plan(standalone_claim, policy["harness_max_facts"])
         if fallback["facts"]:
             fallback["raw_response"] = raw_text
             fallback["model"] = used_model
+            emit(
+                "plan_fallback",
+                claim_text=fallback["standalone_claim"],
+                checkworthy=fallback["checkworthy"],
+                facts_count=len(fallback["facts"]),
+            )
             return fallback
     return plan
 
 
-def run_probe_answers(base_url, model_name, settings, question, policy, probe_index):
+def run_probe_answers(base_url, model_name, settings, question, policy, probe_index, progress_cb=None, progress_context=None):
     answers = []
+    context = dict(progress_context or {})
+
+    def emit(stage, **extra):
+        if progress_cb is None:
+            return
+        payload = dict(context)
+        payload.update(extra)
+        payload["stage"] = stage
+        progress_cb(payload)
+
     for sample_index in range(policy["harness_samples"]):
         prompt = (
             "Answer the factual question with a short phrase only.\n"
@@ -1684,6 +1724,7 @@ def run_probe_answers(base_url, model_name, settings, question, policy, probe_in
         probe_settings["top_p"] = max(0.9, float(settings.get("top_p") or 0.95))
         probe_settings["seed"] = stable_seed(settings.get("seed", 0), question, probe_index, sample_index)
         probe_settings["id_slot"] = probe_slot_for_settings(settings, 1)
+        emit("probe_sample_started", question=question, probe_index=probe_index, sample_index=sample_index + 1)
         raw_text, model_name = completion_text_with_retry(
             base_url,
             prompt,
@@ -1691,11 +1732,29 @@ def run_probe_answers(base_url, model_name, settings, question, policy, probe_in
             probe_settings,
             model_name=model_name,
         )
-        answers.append({"raw": raw_text, "text": normalize_probe_answer(raw_text) or "unknown"})
+        answer_text = normalize_probe_answer(raw_text) or "unknown"
+        answers.append({"raw": raw_text, "text": answer_text})
+        emit(
+            "probe_sample_completed",
+            question=question,
+            probe_index=probe_index,
+            sample_index=sample_index + 1,
+            answer_text=answer_text,
+        )
     return answers, model_name
 
 
-def judge_probe_fact(base_url, model_name, settings, claim, fact_detail, question, answers, policy, fact_index):
+def judge_probe_fact(base_url, model_name, settings, claim, fact_detail, question, answers, policy, fact_index, progress_cb=None, progress_context=None):
+    context = dict(progress_context or {})
+
+    def emit(stage, **extra):
+        if progress_cb is None:
+            return
+        payload = dict(context)
+        payload.update(extra)
+        payload["stage"] = stage
+        progress_cb(payload)
+
     prompt = (
         "You are checking whether a factual detail from a generated claim is stable.\n"
         'Return JSON only with this schema: {"verdict":"supported|conflict|uncertain","agreement":"high|mixed|low","canonical_answer":"...","reason":"..."}\n'
@@ -1715,6 +1774,7 @@ def judge_probe_fact(base_url, model_name, settings, claim, fact_detail, questio
     probe_settings["top_p"] = 0.9
     probe_settings["seed"] = stable_seed(settings.get("seed", 0), fact_detail, fact_index, "judge")
     probe_settings["id_slot"] = probe_slot_for_settings(settings, 1)
+    emit("judge_started", fact_detail=fact_detail, fact_index=fact_index, question=question)
     raw_text, used_model = completion_text_with_retry(
         base_url,
         prompt,
@@ -1742,7 +1802,7 @@ def judge_probe_fact(base_url, model_name, settings, claim, fact_detail, questio
         else:
             fact_risk = {"high": 0.46, "mixed": 0.58, "low": 0.68}[agreement]
 
-    return {
+    result = {
         "verdict": verdict,
         "agreement": agreement,
         "canonical_answer": canonical or None,
@@ -1751,18 +1811,39 @@ def judge_probe_fact(base_url, model_name, settings, claim, fact_detail, questio
         "raw_response": raw_text,
         "model": used_model,
     }
+    emit(
+        "judge_completed",
+        fact_detail=fact_detail,
+        fact_index=fact_index,
+        question=question,
+        verdict=verdict,
+        agreement=agreement,
+        fact_risk=fact_risk,
+    )
+    return result
 
 
-def run_claim_harness(run, focus_token_index, policy):
+def run_claim_harness(run, focus_token_index, policy, progress_cb=None, progress_context=None):
     tokens = run.get("tokens") or []
     if not tokens:
         return {"status": "no_tokens"}
+
+    context = dict(progress_context or {})
+
+    def emit(stage, **extra):
+        if progress_cb is None:
+            return
+        payload = dict(context)
+        payload.update(extra)
+        payload["stage"] = stage
+        progress_cb(payload)
 
     focus_token_index = max(0, min(int(focus_token_index), len(tokens) - 1))
     cache = run.setdefault("analysis", {}).setdefault("claim_harness_cache", {})
     cache_key = str(focus_token_index)
     cached = cache.get(cache_key)
     if isinstance(cached, dict):
+        emit("cache_hit", focus_token_index=focus_token_index, claim_risk=cached.get("claim_risk"), label=cached.get("label"))
         return copy.deepcopy(cached)
 
     claim_span = claim_for_token_index(run, focus_token_index, require_complete=True)
@@ -1777,6 +1858,7 @@ def run_claim_harness(run, focus_token_index, policy):
     text = joined_run_text(run)
     context_start = max(0, claim_span["start"] - 280)
     context_text = text[context_start : claim_span["start"]].strip()
+    emit("claim_selected", focus_token_index=focus_token_index, claim_text=claim_span.get("text"), claim_token_start=claim_span.get("token_start"))
 
     if not claim_span.get("checkworthy"):
         result = {
@@ -1787,7 +1869,16 @@ def run_claim_harness(run, focus_token_index, policy):
         cache[cache_key] = copy.deepcopy(result)
         return result
 
-    plan = build_claim_probe_plan(base_url, model_name, settings, claim_span["text"], context_text, policy)
+    plan = build_claim_probe_plan(
+        base_url,
+        model_name,
+        settings,
+        claim_span["text"],
+        context_text,
+        policy,
+        progress_cb=progress_cb,
+        progress_context={**context, "focus_token_index": focus_token_index},
+    )
     if not plan.get("checkworthy") or not plan.get("facts"):
         result = {
             "status": "not_checkworthy",
@@ -1808,6 +1899,8 @@ def run_claim_harness(run, focus_token_index, policy):
             item["question"],
             policy,
             fact_index,
+            progress_cb=progress_cb,
+            progress_context={**context, "focus_token_index": focus_token_index, "fact_detail": item["fact"]},
         )
         judgement = judge_probe_fact(
             base_url,
@@ -1819,6 +1912,8 @@ def run_claim_harness(run, focus_token_index, policy):
             answers,
             policy,
             fact_index,
+            progress_cb=progress_cb,
+            progress_context={**context, "focus_token_index": focus_token_index, "fact_detail": item["fact"]},
         )
         current_model = judgement.get("model") or current_model
         facts.append(
@@ -1863,6 +1958,16 @@ def run_claim_harness(run, focus_token_index, policy):
         "claim_risk": claim_risk,
         "label": label,
     }
+    emit(
+        "harness_completed",
+        focus_token_index=focus_token_index,
+        claim_text=plan["standalone_claim"],
+        claim_risk=claim_risk,
+        label=label,
+        supported_facts=supported,
+        conflicted_facts=conflicted,
+        uncertain_facts=uncertain,
+    )
     cache[cache_key] = copy.deepcopy(result)
     return result
 
@@ -1880,6 +1985,35 @@ def peak_risk_token_index(run):
             best_risk = risk
             best_idx = idx
     return best_idx
+
+
+def live_token_snapshot(token):
+    if not isinstance(token, dict):
+        return {}
+    snapshot = {}
+    for key in (
+        "index",
+        "t",
+        "text",
+        "chosen_token_id",
+        "chosen_token_text",
+        "logprob",
+        "prob",
+        "entropy",
+        "margin",
+        "uncertainty",
+        "prob_gap",
+        "entropy_delta",
+        "repetition_pressure",
+        "decoder_risk",
+        "velocity",
+        "curvature",
+        "topN",
+        "topn_provider",
+    ):
+        if key in token:
+            snapshot[key] = copy.deepcopy(token[key])
+    return snapshot
 
 
 def decode_candidate_until_claim(run, focus_token_index, max_new_tokens=None):
@@ -2009,6 +2143,13 @@ def decode_run_local(run, max_new_tokens=None, progress_cb=None, phase=None):
         run["analysis"]["regime_markers"] = detect_regime_markers(run["tokens"])
         run["analysis"]["decoder_alerts"] = detect_decoder_alerts(run["tokens"])
         if progress_cb is not None:
+            max_decoder_risk = None
+            for item in run["tokens"]:
+                try:
+                    value = float(item.get("decoder_risk"))
+                except (TypeError, ValueError):
+                    continue
+                max_decoder_risk = value if max_decoder_risk is None else max(max_decoder_risk, value)
             progress_cb(
                 {
                     "phase": phase,
@@ -2016,6 +2157,9 @@ def decode_run_local(run, max_new_tokens=None, progress_cb=None, phase=None):
                     "token_index": token_index,
                     "token_text": token_text,
                     "decoder_risk": token.get("decoder_risk"),
+                    "max_decoder_risk": max_decoder_risk,
+                    "alert_count": len(run["analysis"]["decoder_alerts"]),
+                    "token": live_token_snapshot(token),
                     "text": joined_run_text(run),
                     "token_count": len(run["tokens"]),
                 }
@@ -2406,13 +2550,15 @@ def build_branch_run(body):
 
 def sanitize_live_policy(raw_policy):
     raw_policy = raw_policy if isinstance(raw_policy, dict) else {}
+    correction_loops = sanitize_int(raw_policy.get("correction_loops", raw_policy.get("max_interventions", 2)), 2, minimum=0, maximum=8)
     return {
         "risk_threshold": sanitize_float(raw_policy.get("risk_threshold", 0.64), 0.64, minimum=0.0, maximum=1.0),
         "risk_persistence": sanitize_int(raw_policy.get("risk_persistence", 2), 2, minimum=1, maximum=8),
         "rollback_buffer": sanitize_int(raw_policy.get("rollback_buffer", 1), 1, minimum=0, maximum=6),
         "branch_candidates": sanitize_int(raw_policy.get("branch_candidates", 3), 3, minimum=1, maximum=5),
         "branch_lookahead": sanitize_int(raw_policy.get("branch_lookahead", 6), 6, minimum=1, maximum=24),
-        "max_interventions": sanitize_int(raw_policy.get("max_interventions", 2), 2, minimum=0, maximum=8),
+        "max_interventions": correction_loops,
+        "correction_loops": correction_loops,
         "min_risk_drop": sanitize_float(raw_policy.get("min_risk_drop", 0.08), 0.08, minimum=0.0, maximum=1.0),
         "cooldown_tokens": sanitize_int(raw_policy.get("cooldown_tokens", 4), 4, minimum=0, maximum=24),
         "candidate_harness_topk": sanitize_int(raw_policy.get("candidate_harness_topk", 2), 2, minimum=1, maximum=3),
@@ -2494,6 +2640,126 @@ def run_candidate_branch(parent_run, rollback_index, alt_rank, lookahead):
         "avg_risk": (sum(risks) / len(risks)) if risks else None,
         "max_risk": max(risks) if risks else None,
         "token_count": len(run.get("tokens") or []),
+        "strategy": "prefix_replay",
+    }
+
+
+def format_harness_evidence_for_prompt(harness):
+    if not isinstance(harness, dict):
+        return "- No structured evidence available."
+    facts = harness.get("facts") or []
+    if not facts:
+        return "- Claim looks unstable, but no fact-level probe details were captured."
+    lines = []
+    for item in facts:
+        judgement = item.get("judgement") or {}
+        answers = item.get("answers") or []
+        lines.append(
+            f"- Detail: {item.get('fact') or '-'} | question: {item.get('question') or '-'} | "
+            f"answer1: {answers[0].get('text') if len(answers) > 0 else 'unknown'} | "
+            f"answer2: {answers[1].get('text') if len(answers) > 1 else 'unknown'} | "
+            f"verdict: {judgement.get('verdict') or 'uncertain'} | "
+            f"agreement: {judgement.get('agreement') or 'mixed'} | "
+            f"risk: {judgement.get('fact_risk') if judgement.get('fact_risk') is not None else '-'}"
+        )
+    return "\n".join(lines)
+
+
+def has_abstention_signal(text):
+    lowered = re.sub(r"\s+", " ", str(text or "").strip().lower())
+    patterns = (
+        "cannot verify",
+        "can't verify",
+        "cannot confirm",
+        "can't confirm",
+        "unable to verify",
+        "unable to confirm",
+        "not enough reliable information",
+        "no reliable evidence",
+        "cannot determine",
+        "do not have enough information",
+    )
+    return any(pattern in lowered for pattern in patterns)
+
+
+def run_policy_rewrite_candidate(parent_run, current_harness, rollback_index, policy, progress_cb=None):
+    claim = (current_harness or {}).get("claim") or {}
+    claim_token_start = claim.get("token_start")
+    if claim_token_start is None:
+        claim_token_start = rollback_index
+    claim_token_start = max(0, int(claim_token_start))
+
+    parent_tokens = copy.deepcopy(parent_run.get("tokens") or [])
+    safe_prefix_tokens = copy.deepcopy(parent_tokens[:claim_token_start])
+    safe_prefix_text = "".join(tok.get("text") or "" for tok in safe_prefix_tokens)
+    prompt = parent_run.get("meta", {}).get("prompt", "")
+    current_text = joined_run_text(parent_run)
+    risky_claim_text = (current_harness.get("standalone_claim") or claim.get("text") or "").strip()
+    evidence_text = format_harness_evidence_for_prompt(current_harness)
+
+    rewrite_prompt = (
+        "You are revising a draft answer to remove unsupported or unstable specifics.\n"
+        "Write the revised answer in natural prose, not bullet commentary about the edit.\n"
+        "Rules:\n"
+        "- Keep the safe prefix unchanged.\n"
+        "- Remove or soften unsupported specifics.\n"
+        "- Do not invent new concrete details.\n"
+        "- Prefer explicit uncertainty over swapping one concrete detail for another guess.\n"
+        "- Do not replace one title, ISBN, publisher, date, quotation, or case identifier with a new unsupported one.\n"
+        "- If multiple key details are unstable, say you cannot verify the underlying work, case, or source instead of fabricating substitutes.\n"
+        "- If the central premise or a key bibliographic detail cannot be verified, say you cannot verify it.\n"
+        "- Preserve the user's requested language and format when possible.\n\n"
+        "Original user request:\n"
+        f"{prompt}\n\n"
+        "Draft answer so far:\n"
+        f"{current_text}\n\n"
+        "Risky claim:\n"
+        f"{risky_claim_text}\n\n"
+        "Probe evidence:\n"
+        f"{evidence_text}\n\n"
+        "Revised answer:\n"
+        f"{safe_prefix_text}"
+    )
+
+    settings = copy.deepcopy(parent_run.get("meta", {}).get("generation_settings") or {})
+    settings = sanitize_settings(settings)
+    settings["temperature"] = min(float(settings.get("temperature") or 0.7), 0.2)
+    settings["top_p"] = min(float(settings.get("top_p") or 0.95), 0.9)
+    settings["seed"] = stable_seed(settings.get("seed", 0), risky_claim_text, "policy-rewrite")
+    settings["id_slot"] = probe_slot_for_settings(settings, 6)
+    prefill_tokens = prefill_tokens_from_text(safe_prefix_text, short_hash(prompt), settings.get("top_n", 5))
+    run = create_run_object(
+        prompt=prompt,
+        base_url=parent_run.get("meta", {}).get("base_url", DEFAULTS["base_url"]),
+        settings=settings,
+        label=f"Rewrite@{claim_token_start}",
+        prefill_tokens=prefill_tokens,
+        inference_prompt=rewrite_prompt,
+    )
+
+    max_new_tokens = min(
+        max(16, int(policy["branch_lookahead"]) * 4),
+        max(0, settings.get("max_tokens", DEFAULTS["max_tokens"]) - len(prefill_tokens)),
+    )
+    decode_run_local(
+        run,
+        max_new_tokens=max_new_tokens,
+        progress_cb=progress_cb,
+        phase="rewrite_candidate",
+    )
+
+    candidate_window = run.get("tokens", [])[claim_token_start:]
+    risks = [float(t.get("decoder_risk") or 0.0) for t in candidate_window] if candidate_window else []
+    return {
+        "run": run,
+        "alt_rank": -1,
+        "alt_token_text": "[policy rewrite]",
+        "alt_token_id": None,
+        "avg_risk": (sum(risks) / len(risks)) if risks else None,
+        "max_risk": max(risks) if risks else None,
+        "token_count": len(run.get("tokens") or []),
+        "strategy": "policy_rewrite",
+        "window_start": claim_token_start,
     }
 
 
@@ -2505,318 +2771,668 @@ def run_live_correction_experiment(prompt, base_url, settings, policy, experimen
         event.update(payload)
         broadcast_event(event)
 
-    baseline = create_run_object(prompt=prompt, base_url=base_url, settings=sanitize_settings(copy.deepcopy(settings)), label="Baseline")
-    corrected = create_run_object(prompt=prompt, base_url=base_url, settings=sanitize_settings(copy.deepcopy(settings)), label="Corrected")
+    status_lock = threading.Lock()
+    status_state = {
+        "phase": "setup",
+        "message": "Preparing live experiment.",
+        "since": time.monotonic(),
+        "rewrite_pass": 1,
+        "accepted_rewrites": 0,
+        "loop_budget": policy.get("correction_loops", 0),
+    }
+    heartbeat_stop = threading.Event()
 
-    progress(
-        "live_experiment_started",
-        {
-            "baseline_run_id": baseline["run_id"],
-            "corrected_run_id": corrected["run_id"],
-            "mode": "prefix_replay",
-        },
-    )
+    def snapshot_status():
+        with status_lock:
+            snap = copy.deepcopy(status_state)
+        since = snap.pop("since", time.monotonic())
+        snap["waiting_ms"] = max(0, int((time.monotonic() - since) * 1000))
+        return snap
 
-    decode_run_local(
-        baseline,
-        progress_cb=lambda payload: progress("live_experiment_progress", payload),
-        phase="baseline",
-    )
+    def update_status(message, **extra):
+        with status_lock:
+            status_state["message"] = message
+            status_state["since"] = time.monotonic()
+            status_state.update(extra)
+            snap = copy.deepcopy(status_state)
+        since = snap.pop("since", time.monotonic())
+        snap["waiting_ms"] = max(0, int((time.monotonic() - since) * 1000))
+        progress("live_experiment_status", snap)
 
-    started = time.monotonic()
-    initialize_prefill_tokens(corrected)
-    meta = corrected["meta"]
-    cfg = meta["generation_settings"]
-    prompt_hash = meta["prompt_hash"]
-    model_name = meta.get("model")
-    base_url = meta["base_url"]
-    inference_prompt = meta.get("inference_prompt") or meta.get("prompt", "")
+    def heartbeat_worker():
+        while not heartbeat_stop.wait(2.0):
+            progress("live_experiment_status", snapshot_status())
 
-    vector_provider = VectorProvider(
-        cfg.get("vector_mode", "placeholder"),
-        base_url,
-        cfg.get("vector_dim", DEFAULTS["vector_dim"]),
-        cfg.get("vector_window", DEFAULTS["vector_window"]),
-        prompt_hash,
-    )
-    history_text = [t.get("text") or "" for t in corrected["tokens"]]
-    if corrected["tokens"] and isinstance(corrected["tokens"][-1].get("embedding"), list):
-        vector_provider.prev = corrected["tokens"][-1]["embedding"]
+    heartbeat_thread = threading.Thread(target=heartbeat_worker, name="live-experiment-heartbeat", daemon=True)
+    heartbeat_thread.start()
 
-    token_index = len(corrected["tokens"])
-    generated_text = ""
-    remaining = max(0, cfg.get("max_tokens", DEFAULTS["max_tokens"]) - token_index)
-    interventions = []
-    last_intervention_index = -999
-    last_harness_claim_key = None
+    try:
+        baseline = create_run_object(prompt=prompt, base_url=base_url, settings=sanitize_settings(copy.deepcopy(settings)), label="Baseline")
+        corrected = create_run_object(prompt=prompt, base_url=base_url, settings=sanitize_settings(copy.deepcopy(settings)), label="Corrected")
 
-    while remaining > 0:
-        token, stop_info, model_name = generate_single_token_step(
-            base_url,
-            inference_prompt + generated_text,
-            cfg,
-            model_name,
-            prompt_hash,
-            token_index,
-            history_text,
-            vector_provider,
-            started,
-        )
-        if model_name and meta.get("model") != model_name:
-            meta["model"] = model_name
-        if token is None:
-            break
-
-        token_text = token.get("text", "")
-        generated_text += token_text
-        history_text.append(token_text)
-        meta["providers"]["embedding"] = vector_provider.mode
-        add_token_local(corrected, token)
         progress(
-            "live_experiment_progress",
+            "live_experiment_started",
             {
-                "phase": "corrected",
-                "run_id": corrected["run_id"],
-                "token_index": token_index,
-                "token_text": token_text,
-                "decoder_risk": token.get("decoder_risk"),
-                "text": joined_run_text(corrected),
-                "token_count": len(corrected["tokens"]),
+                "baseline_run_id": baseline["run_id"],
+                "corrected_run_id": corrected["run_id"],
+                "mode": "prefix_replay",
+                "correction_loops": policy["correction_loops"],
             },
         )
-        token_index += 1
-        remaining -= 1
 
-        recompute_kinematics(corrected["tokens"])
-        enrich_decoder_diagnostics(corrected["tokens"])
-        corrected["analysis"]["regime_markers"] = detect_regime_markers(corrected["tokens"])
-        corrected["analysis"]["decoder_alerts"] = detect_decoder_alerts(corrected["tokens"])
+        update_status("Decoding baseline path token by token.", phase="baseline", rewrite_pass=1, accepted_rewrites=0)
+        decode_run_local(
+            baseline,
+            progress_cb=lambda payload: progress("live_experiment_progress", payload),
+            phase="baseline",
+        )
 
-        if (
-            len(interventions) < policy["max_interventions"]
-            and len(corrected["tokens"]) - 1 >= last_intervention_index + policy["cooldown_tokens"]
-        ):
-            rollback_index, current_avg_risk = rollback_index_for_run(corrected, policy)
-            if rollback_index is not None:
-                trigger_index = len(corrected["tokens"]) - 1
-                focus_claim = claim_for_token_index(corrected, rollback_index, require_complete=True)
-                claim_key = None
-                if focus_claim is not None:
-                    claim_key = (focus_claim.get("start"), focus_claim.get("end"))
-                if claim_key is None or claim_key == last_harness_claim_key:
-                    if stop_info.get("hard_stop"):
-                        break
-                    if stop_info.get("stop") and remaining <= 0:
-                        break
-                    continue
+        started = time.monotonic()
+        initialize_prefill_tokens(corrected)
+        meta = corrected["meta"]
+        cfg = meta["generation_settings"]
+        prompt_hash = meta["prompt_hash"]
+        model_name = meta.get("model")
+        base_url = meta["base_url"]
+        inference_prompt = meta.get("inference_prompt") or meta.get("prompt", "")
 
-                current_harness = run_claim_harness(corrected, rollback_index, policy)
-                last_harness_claim_key = claim_key
-                progress(
-                    "live_experiment_harness",
-                    {
-                        "phase": "corrected",
-                        "run_id": corrected["run_id"],
-                        "rollback_index": rollback_index,
-                        "trigger_index": trigger_index,
-                        "status": current_harness.get("status"),
-                        "label": current_harness.get("label"),
-                        "claim_risk": current_harness.get("claim_risk"),
-                        "claim_text": (current_harness.get("standalone_claim") or ((current_harness.get("claim") or {}).get("text")) or ""),
-                    },
+        vector_provider = VectorProvider(
+            cfg.get("vector_mode", "placeholder"),
+            base_url,
+            cfg.get("vector_dim", DEFAULTS["vector_dim"]),
+            cfg.get("vector_window", DEFAULTS["vector_window"]),
+            prompt_hash,
+        )
+        history_text = [t.get("text") or "" for t in corrected["tokens"]]
+        if corrected["tokens"] and isinstance(corrected["tokens"][-1].get("embedding"), list):
+            vector_provider.prev = corrected["tokens"][-1]["embedding"]
+
+        token_index = len(corrected["tokens"])
+        generated_text = ""
+        remaining = max(0, cfg.get("max_tokens", DEFAULTS["max_tokens"]) - token_index)
+        interventions = []
+        last_intervention_index = -999
+        last_harness_claim_key = None
+        update_status(
+            "Decoding live replay path token by token.",
+            phase="corrected",
+            rewrite_pass=1,
+            accepted_rewrites=0,
+            loop_budget=policy["correction_loops"],
+        )
+
+        def describe_harness_stage(payload):
+            stage = payload.get("stage")
+            if stage == "cache_hit":
+                return "Reusing cached claim evidence."
+            if stage == "claim_selected":
+                return "Selected a check-worthy claim near the risky region."
+            if stage == "plan_started":
+                return "Planning targeted factual probes for the risky claim."
+            if stage == "plan_ready":
+                return f"Prepared {payload.get('facts_count', 0)} factual probes for the claim."
+            if stage == "plan_fallback":
+                return "Fell back to heuristic fact extraction for the risky claim."
+            if stage == "probe_sample_started":
+                return f"Asking probe {payload.get('probe_index', 0) + 1}, sample {payload.get('sample_index', 1)}."
+            if stage == "probe_sample_completed":
+                return f"Probe {payload.get('probe_index', 0) + 1}, sample {payload.get('sample_index', 1)} returned: {payload.get('answer_text') or 'unknown'}."
+            if stage == "judge_started":
+                return f"Judging factual detail {payload.get('fact_index', 0) + 1}."
+            if stage == "judge_completed":
+                return (
+                    f"Judged detail {payload.get('fact_index', 0) + 1}: "
+                    f"{payload.get('verdict', 'uncertain')} at risk {payload.get('fact_risk') if payload.get('fact_risk') is not None else '-'}."
                 )
+            if stage == "harness_completed":
+                return (
+                    f"Claim evidence complete: {payload.get('label', 'unknown')} "
+                    f"at {payload.get('claim_risk') if payload.get('claim_risk') is not None else '-'}."
+                )
+            return "Evaluating risky claim."
 
-                if (
-                    current_harness.get("status") == "ok"
-                    and current_harness.get("claim_risk") is not None
-                    and current_harness["claim_risk"] >= policy["harness_trigger_threshold"]
-                ):
-                    target = corrected["tokens"][rollback_index]
-                    topn = target.get("topN") or []
-                    candidate_results = []
-                    limit = min(len(topn), policy["branch_candidates"] + 1)
-                    for alt_rank in range(1, limit):
-                        alt_text = str((topn[alt_rank] or {}).get("token_text") or "")
-                        if not alt_text.strip() or not any(ch.isalnum() for ch in alt_text):
-                            continue
-                        result = run_candidate_branch(corrected, rollback_index, alt_rank, policy["branch_lookahead"])
-                        if result is not None:
-                            candidate_results.append(result)
+        while remaining > 0:
+            token, stop_info, model_name = generate_single_token_step(
+                base_url,
+                inference_prompt + generated_text,
+                cfg,
+                model_name,
+                prompt_hash,
+                token_index,
+                history_text,
+                vector_provider,
+                started,
+            )
+            if model_name and meta.get("model") != model_name:
+                meta["model"] = model_name
+            if token is None:
+                break
 
-                    candidate_results = [c for c in candidate_results if c.get("avg_risk") is not None]
-                    candidate_results.sort(key=lambda item: (item.get("avg_risk"), item.get("max_risk") or 0.0))
+            token_text = token.get("text", "")
+            generated_text += token_text
+            history_text.append(token_text)
+            meta["providers"]["embedding"] = vector_provider.mode
+            add_token_local(corrected, token)
+            token_index += 1
+            remaining -= 1
 
-                    for item in candidate_results[: policy["candidate_harness_topk"]]:
-                        item["harness"] = run_claim_harness(item["run"], rollback_index, policy)
+            recompute_kinematics(corrected["tokens"])
+            enrich_decoder_diagnostics(corrected["tokens"])
+            corrected["analysis"]["regime_markers"] = detect_regime_markers(corrected["tokens"])
+            corrected["analysis"]["decoder_alerts"] = detect_decoder_alerts(corrected["tokens"])
+            max_decoder_risk = None
+            for item in corrected["tokens"]:
+                try:
+                    value = float(item.get("decoder_risk"))
+                except (TypeError, ValueError):
+                    continue
+                max_decoder_risk = value if max_decoder_risk is None else max(max_decoder_risk, value)
+            progress(
+                "live_experiment_progress",
+                {
+                    "phase": "corrected",
+                    "run_id": corrected["run_id"],
+                    "token_index": token_index - 1,
+                    "token_text": token_text,
+                    "decoder_risk": token.get("decoder_risk"),
+                    "max_decoder_risk": max_decoder_risk,
+                    "alert_count": len(corrected["analysis"]["decoder_alerts"]),
+                    "token": live_token_snapshot(token),
+                    "text": joined_run_text(corrected),
+                    "token_count": len(corrected["tokens"]),
+                    "rewrite_pass": len(interventions) + 1,
+                    "accepted_rewrites": len(interventions),
+                    "loop_budget": policy["correction_loops"],
+                },
+            )
 
-                    ranked_candidates = []
-                    for item in candidate_results:
-                        harness = item.get("harness")
-                        harness_risk = None
-                        if isinstance(harness, dict):
-                            harness_risk = harness.get("claim_risk")
-                        ranked_candidates.append(
-                            {
-                                **item,
-                                "harness_risk": harness_risk,
-                            }
-                        )
+            if (
+                len(interventions) < policy["max_interventions"]
+                and len(corrected["tokens"]) - 1 >= last_intervention_index + policy["cooldown_tokens"]
+            ):
+                rollback_index, current_avg_risk = rollback_index_for_run(corrected, policy)
+                if rollback_index is not None:
+                    trigger_index = len(corrected["tokens"]) - 1
+                    focus_claim = claim_for_token_index(corrected, rollback_index, require_complete=True)
+                    claim_key = None
+                    if focus_claim is not None:
+                        claim_key = (focus_claim.get("start"), focus_claim.get("end"))
+                    if claim_key is None or claim_key == last_harness_claim_key:
+                        if stop_info.get("hard_stop"):
+                            break
+                        if stop_info.get("stop") and remaining <= 0:
+                            break
+                        continue
 
-                    valid_candidates = [item for item in ranked_candidates if item.get("harness_risk") is not None]
-                    valid_candidates.sort(key=lambda item: (item.get("harness_risk"), item.get("avg_risk"), item.get("max_risk") or 0.0))
-                    best = valid_candidates[0] if valid_candidates else None
+                    rewrite_pass = len(interventions) + 1
 
-                    baseline_claim_risk = float(current_harness["claim_risk"])
-                    harness_improved = (
-                        best is not None
-                        and best.get("harness_risk") is not None
-                        and best["harness_risk"] <= (baseline_claim_risk - policy["harness_min_drop"])
-                    )
-                    risk_improved = (
-                        best is not None
-                        and current_avg_risk is not None
-                        and best.get("avg_risk") is not None
-                        and best["avg_risk"] <= (current_avg_risk - max(0.02, policy["min_risk_drop"] * 0.5))
-                    )
-
-                    if best is not None and harness_improved and risk_improved:
-                        chosen_harness = best.get("harness") or {}
-                        corrected["tokens"] = best["run"]["tokens"]
-                        corrected["meta"]["providers"]["embedding"] = best["run"]["meta"]["providers"].get("embedding", corrected["meta"]["providers"].get("embedding"))
-                        recompute_kinematics(corrected["tokens"])
-                        enrich_decoder_diagnostics(corrected["tokens"])
-                        corrected["analysis"]["regime_markers"] = detect_regime_markers(corrected["tokens"])
-                        corrected["analysis"]["decoder_alerts"] = detect_decoder_alerts(corrected["tokens"])
-
-                        history_text = [t.get("text") or "" for t in corrected["tokens"]]
-                        token_index = len(corrected["tokens"])
-                        generated_text = "".join(history_text)
-                        remaining = max(0, cfg.get("max_tokens", DEFAULTS["max_tokens"]) - token_index)
-                        vector_provider = VectorProvider(
-                            corrected["meta"]["providers"].get("embedding", cfg.get("vector_mode", "placeholder")),
-                            base_url,
-                            cfg.get("vector_dim", DEFAULTS["vector_dim"]),
-                            cfg.get("vector_window", DEFAULTS["vector_window"]),
-                            prompt_hash,
-                        )
-                        if corrected["tokens"] and isinstance(corrected["tokens"][-1].get("embedding"), list):
-                            vector_provider.prev = corrected["tokens"][-1]["embedding"]
-
-                        interventions.append(
-                            {
-                                "mode": "prefix_replay",
-                                "trigger_index": trigger_index,
-                                "rollback_index": rollback_index,
-                                "baseline_avg_risk": current_avg_risk,
-                                "baseline_claim_risk": current_harness.get("claim_risk"),
-                                "baseline_claim_label": current_harness.get("label"),
-                                "baseline_claim": current_harness.get("standalone_claim") or ((current_harness.get("claim") or {}).get("text")),
-                                "chosen_alt_rank": best["alt_rank"],
-                                "chosen_alt_text": best["alt_token_text"],
-                                "chosen_avg_risk": best["avg_risk"],
-                                "chosen_max_risk": best["max_risk"],
-                                "chosen_claim_risk": chosen_harness.get("claim_risk"),
-                                "chosen_claim_label": chosen_harness.get("label"),
-                                "chosen_claim": chosen_harness.get("standalone_claim") or ((chosen_harness.get("claim") or {}).get("text")),
-                                "baseline_harness": copy.deepcopy(current_harness),
-                                "chosen_harness": copy.deepcopy(chosen_harness),
-                                "candidates": [
-                                    {
-                                        "alt_rank": item["alt_rank"],
-                                        "alt_token_text": item["alt_token_text"],
-                                        "avg_risk": item["avg_risk"],
-                                        "max_risk": item["max_risk"],
-                                        "claim_risk": item.get("harness_risk"),
-                                        "claim_label": (item.get("harness") or {}).get("label"),
-                                        "accepted": item["alt_rank"] == best["alt_rank"],
-                                    }
-                                    for item in ranked_candidates
-                                ],
-                            }
+                    def harness_progress(payload):
+                        update_status(
+                            describe_harness_stage(payload),
+                            phase="corrected",
+                            rewrite_pass=rewrite_pass,
+                            accepted_rewrites=len(interventions),
+                            loop_budget=policy["correction_loops"],
+                            rollback_index=rollback_index,
+                            trigger_index=trigger_index,
+                            harness_stage=payload.get("stage"),
                         )
                         progress(
-                            "live_experiment_intervention",
+                            "live_experiment_harness",
                             {
+                                "phase": "corrected",
+                                "run_id": corrected["run_id"],
                                 "rollback_index": rollback_index,
                                 "trigger_index": trigger_index,
-                                "baseline_avg_risk": current_avg_risk,
-                                "chosen_alt_rank": best["alt_rank"],
-                                "chosen_alt_text": best["alt_token_text"],
-                                "chosen_avg_risk": best["avg_risk"],
-                                "chosen_max_risk": best["max_risk"],
-                                "baseline_claim_risk": current_harness.get("claim_risk"),
-                                "baseline_claim_label": current_harness.get("label"),
-                                "baseline_claim": current_harness.get("standalone_claim") or ((current_harness.get("claim") or {}).get("text")),
-                                "chosen_claim_risk": chosen_harness.get("claim_risk"),
-                                "chosen_claim_label": chosen_harness.get("label"),
-                                "chosen_claim": chosen_harness.get("standalone_claim") or ((chosen_harness.get("claim") or {}).get("text")),
-                                "candidates": [
-                                    {
-                                        "alt_rank": item["alt_rank"],
-                                        "alt_token_text": item["alt_token_text"],
-                                        "avg_risk": item["avg_risk"],
-                                        "max_risk": item["max_risk"],
-                                        "claim_risk": item.get("harness_risk"),
-                                        "claim_label": (item.get("harness") or {}).get("label"),
-                                        "accepted": item["alt_rank"] == best["alt_rank"],
-                                    }
-                                    for item in ranked_candidates
-                                ],
-                                "corrected_text": joined_run_text(corrected),
-                                "corrected_run_id": corrected["run_id"],
-                                "baseline_harness": copy.deepcopy(current_harness),
-                                "chosen_harness": copy.deepcopy(chosen_harness),
+                                "rewrite_pass": rewrite_pass,
+                                "accepted_rewrites": len(interventions),
+                                "loop_budget": policy["correction_loops"],
+                                **payload,
                             },
                         )
-                        last_intervention_index = len(corrected["tokens"]) - 1
 
-        if stop_info.get("hard_stop"):
-            break
-        if stop_info.get("stop") and remaining <= 0:
-            break
+                    current_harness = run_claim_harness(
+                        corrected,
+                        rollback_index,
+                        policy,
+                        progress_cb=harness_progress,
+                        progress_context={"run_id": corrected["run_id"]},
+                    )
+                    last_harness_claim_key = claim_key
+                    progress(
+                        "live_experiment_harness",
+                        {
+                            "phase": "corrected",
+                            "run_id": corrected["run_id"],
+                            "rollback_index": rollback_index,
+                            "trigger_index": trigger_index,
+                            "rewrite_pass": rewrite_pass,
+                            "accepted_rewrites": len(interventions),
+                            "loop_budget": policy["correction_loops"],
+                            "status": current_harness.get("status"),
+                            "label": current_harness.get("label"),
+                            "claim_risk": current_harness.get("claim_risk"),
+                            "claim_text": (current_harness.get("standalone_claim") or ((current_harness.get("claim") or {}).get("text")) or ""),
+                        },
+                    )
 
-    finalize_completed_run(corrected, started, status="complete")
-    corrected.setdefault("meta", {}).setdefault("live_experiment", {})
-    corrected["meta"]["live_experiment"]["had_intervention"] = bool(interventions)
-    corrected["meta"]["live_experiment"]["comparison_role"] = "corrected" if interventions else "replay_sample"
-    if not interventions:
-        corrected["meta"]["label"] = "Replay"
-    corrected.setdefault("analysis", {})["interventions"] = copy.deepcopy(interventions)
-    baseline_harness = run_claim_harness(baseline, peak_risk_token_index(baseline), policy)
-    corrected_harness = run_claim_harness(corrected, peak_risk_token_index(corrected), policy)
-    baseline.setdefault("analysis", {})["focus_claim"] = copy.deepcopy(baseline_harness)
-    corrected.setdefault("analysis", {})["focus_claim"] = copy.deepcopy(corrected_harness)
+                    if (
+                        current_harness.get("status") == "ok"
+                        and current_harness.get("claim_risk") is not None
+                        and current_harness["claim_risk"] >= policy["harness_trigger_threshold"]
+                    ):
+                        candidate_results = []
+                        target = corrected["tokens"][rollback_index]
+                        topn = target.get("topN") or []
+                        limit = min(len(topn), policy["branch_candidates"] + 1)
+                        for alt_rank in range(1, limit):
+                            alt_text = str((topn[alt_rank] or {}).get("token_text") or "")
+                            if not alt_text.strip() or not any(ch.isalnum() for ch in alt_text):
+                                continue
+                            update_status(
+                                f"Decoding prefix candidate {alt_rank + 1} from rollback token {rollback_index}.",
+                                phase="candidate",
+                                rewrite_pass=rewrite_pass,
+                                accepted_rewrites=len(interventions),
+                                loop_budget=policy["correction_loops"],
+                                candidate_strategy="prefix_replay",
+                                candidate_rank=alt_rank,
+                            )
+                            progress(
+                                "live_experiment_candidate",
+                                {
+                                    "stage": "candidate_started",
+                                    "strategy": "prefix_replay",
+                                    "alt_rank": alt_rank,
+                                    "alt_token_text": alt_text,
+                                    "rollback_index": rollback_index,
+                                    "trigger_index": trigger_index,
+                                    "rewrite_pass": rewrite_pass,
+                                    "accepted_rewrites": len(interventions),
+                                    "loop_budget": policy["correction_loops"],
+                                },
+                            )
+                            result = run_candidate_branch(corrected, rollback_index, alt_rank, policy["branch_lookahead"])
+                            if result is not None:
+                                candidate_results.append(result)
+                                progress(
+                                    "live_experiment_candidate",
+                                    {
+                                        "stage": "candidate_completed",
+                                        "strategy": "prefix_replay",
+                                        "alt_rank": alt_rank,
+                                        "alt_token_text": alt_text,
+                                        "avg_risk": result.get("avg_risk"),
+                                        "max_risk": result.get("max_risk"),
+                                        "rewrite_pass": rewrite_pass,
+                                        "accepted_rewrites": len(interventions),
+                                        "loop_budget": policy["correction_loops"],
+                                    },
+                                )
 
-    with RUNS_LOCK:
-        RUNS[baseline["run_id"]] = copy.deepcopy(baseline)
-        RUNS[corrected["run_id"]] = copy.deepcopy(corrected)
-        if baseline["run_id"] not in RUN_ORDER:
-            RUN_ORDER.append(baseline["run_id"])
-        if corrected["run_id"] not in RUN_ORDER:
-            RUN_ORDER.append(corrected["run_id"])
+                        update_status(
+                            "Generating a conservative policy rewrite candidate.",
+                            phase="rewrite_candidate",
+                            rewrite_pass=rewrite_pass,
+                            accepted_rewrites=len(interventions),
+                            loop_budget=policy["correction_loops"],
+                            rollback_index=rollback_index,
+                            trigger_index=trigger_index,
+                        )
+                        progress(
+                            "live_experiment_candidate",
+                            {
+                                "stage": "candidate_started",
+                                "strategy": "policy_rewrite",
+                                "alt_rank": -1,
+                                "alt_token_text": "[policy rewrite]",
+                                "rollback_index": rollback_index,
+                                "trigger_index": trigger_index,
+                                "rewrite_pass": rewrite_pass,
+                                "accepted_rewrites": len(interventions),
+                                "loop_budget": policy["correction_loops"],
+                            },
+                        )
+                        rewrite_candidate = run_policy_rewrite_candidate(
+                            corrected,
+                            current_harness,
+                            rollback_index,
+                            policy,
+                            progress_cb=lambda payload: progress(
+                                "live_experiment_progress",
+                                {
+                                    **payload,
+                                    "rewrite_pass": rewrite_pass,
+                                    "accepted_rewrites": len(interventions),
+                                    "loop_budget": policy["correction_loops"],
+                                },
+                            ),
+                        )
+                        candidate_results.append(rewrite_candidate)
+                        progress(
+                            "live_experiment_candidate",
+                            {
+                                "stage": "candidate_completed",
+                                "strategy": "policy_rewrite",
+                                "alt_rank": -1,
+                                "alt_token_text": "[policy rewrite]",
+                                "avg_risk": rewrite_candidate.get("avg_risk"),
+                                "max_risk": rewrite_candidate.get("max_risk"),
+                                "rewrite_pass": rewrite_pass,
+                                "accepted_rewrites": len(interventions),
+                                "loop_budget": policy["correction_loops"],
+                            },
+                        )
 
-    return {
-        "mode": "prefix_replay",
-        "baseline_run_id": baseline["run_id"],
-        "corrected_run_id": corrected["run_id"],
-        "baseline": baseline,
-        "corrected": corrected,
-        "interventions": interventions,
-        "harness": {
-            "baseline": baseline_harness,
-            "corrected": corrected_harness,
-        },
-        "policy": policy,
-        "metrics": {
-            "baseline_max_risk": baseline.get("summary", {}).get("decoder_risk_max"),
-            "corrected_max_risk": corrected.get("summary", {}).get("decoder_risk_max"),
-            "baseline_alerts": baseline.get("summary", {}).get("decoder_alert_count"),
-            "corrected_alerts": corrected.get("summary", {}).get("decoder_alert_count"),
-            "baseline_claim_risk": baseline_harness.get("claim_risk") if isinstance(baseline_harness, dict) else None,
-            "corrected_claim_risk": corrected_harness.get("claim_risk") if isinstance(corrected_harness, dict) else None,
-            "intervention_count": len(interventions),
-        },
-    }
+                        for item in candidate_results:
+                            focus_index = item.get("window_start", rollback_index)
+
+                            def candidate_harness_progress(payload, item=item):
+                                update_status(
+                                    describe_harness_stage(payload),
+                                    phase="candidate_harness",
+                                    rewrite_pass=rewrite_pass,
+                                    accepted_rewrites=len(interventions),
+                                    loop_budget=policy["correction_loops"],
+                                    candidate_strategy=item.get("strategy"),
+                                    candidate_rank=item.get("alt_rank"),
+                                )
+                                progress(
+                                    "live_experiment_harness",
+                                    {
+                                        "phase": "candidate",
+                                        "run_id": item["run"]["run_id"],
+                                        "rollback_index": rollback_index,
+                                        "trigger_index": trigger_index,
+                                        "rewrite_pass": rewrite_pass,
+                                        "accepted_rewrites": len(interventions),
+                                        "loop_budget": policy["correction_loops"],
+                                        "candidate_strategy": item.get("strategy"),
+                                        "candidate_alt_rank": item.get("alt_rank"),
+                                        **payload,
+                                    },
+                                )
+
+                            item["harness"] = run_claim_harness(
+                                item["run"],
+                                focus_index,
+                                policy,
+                                progress_cb=candidate_harness_progress,
+                                progress_context={"run_id": item["run"]["run_id"]},
+                            )
+
+                        ranked_candidates = []
+                        for item in candidate_results:
+                            harness = item.get("harness")
+                            harness_risk = harness.get("claim_risk") if isinstance(harness, dict) else None
+                            ranked_candidates.append({**item, "harness_risk": harness_risk})
+
+                        valid_candidates = [item for item in ranked_candidates if item.get("harness_risk") is not None]
+                        valid_candidates.sort(
+                            key=lambda item: (
+                                item.get("harness_risk"),
+                                item.get("avg_risk") if item.get("avg_risk") is not None else 1.0,
+                                item.get("max_risk") or 0.0,
+                            )
+                        )
+                        best = valid_candidates[0] if valid_candidates else None
+
+                        baseline_claim_risk = float(current_harness["claim_risk"])
+                        harness_improved = (
+                            best is not None
+                            and best.get("harness_risk") is not None
+                            and best["harness_risk"] <= (baseline_claim_risk - policy["harness_min_drop"])
+                        )
+                        risk_improved = (
+                            best is not None
+                            and current_avg_risk is not None
+                            and best.get("avg_risk") is not None
+                            and best["avg_risk"] <= (current_avg_risk - max(0.02, policy["min_risk_drop"] * 0.5))
+                        )
+                        rewrite_safe_enough = (
+                            best is not None
+                            and best.get("strategy") == "policy_rewrite"
+                            and best.get("avg_risk") is not None
+                            and (
+                                current_avg_risk is None
+                                or best["avg_risk"] <= current_avg_risk + 0.05
+                            )
+                        )
+                        rewrite_abstains = (
+                            best is not None
+                            and best.get("strategy") == "policy_rewrite"
+                            and has_abstention_signal(joined_run_text(best.get("run")))
+                            and best.get("harness_risk") is not None
+                            and best["harness_risk"] <= baseline_claim_risk + 0.03
+                        )
+                        accepted_best = best is not None and (
+                            (harness_improved and (risk_improved or rewrite_safe_enough))
+                            or rewrite_abstains
+                        )
+
+                        if rewrite_candidate is not None:
+                            rewrite_accepted = accepted_best and best is not None and best.get("strategy") == "policy_rewrite"
+                            progress(
+                                "live_experiment_candidate",
+                                {
+                                    "stage": "candidate_result",
+                                    "strategy": "policy_rewrite",
+                                    "accepted": rewrite_accepted,
+                                    "candidate_run_id": rewrite_candidate["run"]["run_id"],
+                                    "candidate_run": copy.deepcopy(rewrite_candidate["run"]),
+                                    "current_corrected_run": copy.deepcopy(corrected),
+                                    "rewrite_pass": rewrite_pass,
+                                    "accepted_rewrites": len(interventions),
+                                    "loop_budget": policy["correction_loops"],
+                                },
+                            )
+
+                        if accepted_best:
+                            chosen_harness = best.get("harness") or {}
+                            corrected["tokens"] = best["run"]["tokens"]
+                            corrected["meta"]["providers"]["embedding"] = best["run"]["meta"]["providers"].get(
+                                "embedding",
+                                corrected["meta"]["providers"].get("embedding"),
+                            )
+                            recompute_kinematics(corrected["tokens"])
+                            enrich_decoder_diagnostics(corrected["tokens"])
+                            corrected["analysis"]["regime_markers"] = detect_regime_markers(corrected["tokens"])
+                            corrected["analysis"]["decoder_alerts"] = detect_decoder_alerts(corrected["tokens"])
+
+                            history_text = [t.get("text") or "" for t in corrected["tokens"]]
+                            token_index = len(corrected["tokens"])
+                            generated_text = "".join(history_text)
+                            remaining = max(0, cfg.get("max_tokens", DEFAULTS["max_tokens"]) - token_index)
+                            vector_provider = VectorProvider(
+                                corrected["meta"]["providers"].get("embedding", cfg.get("vector_mode", "placeholder")),
+                                base_url,
+                                cfg.get("vector_dim", DEFAULTS["vector_dim"]),
+                                cfg.get("vector_window", DEFAULTS["vector_window"]),
+                                prompt_hash,
+                            )
+                            if corrected["tokens"] and isinstance(corrected["tokens"][-1].get("embedding"), list):
+                                vector_provider.prev = corrected["tokens"][-1]["embedding"]
+
+                            interventions.append(
+                                {
+                                    "mode": best.get("strategy"),
+                                    "trigger_index": trigger_index,
+                                    "rollback_index": rollback_index,
+                                    "baseline_avg_risk": current_avg_risk,
+                                    "baseline_claim_risk": current_harness.get("claim_risk"),
+                                    "baseline_claim_label": current_harness.get("label"),
+                                    "baseline_claim": current_harness.get("standalone_claim") or ((current_harness.get("claim") or {}).get("text")),
+                                    "chosen_alt_rank": best["alt_rank"],
+                                    "chosen_alt_text": best["alt_token_text"],
+                                    "chosen_strategy": best.get("strategy"),
+                                    "chosen_avg_risk": best["avg_risk"],
+                                    "chosen_max_risk": best["max_risk"],
+                                    "chosen_claim_risk": chosen_harness.get("claim_risk"),
+                                    "chosen_claim_label": chosen_harness.get("label"),
+                                    "chosen_claim": chosen_harness.get("standalone_claim") or ((chosen_harness.get("claim") or {}).get("text")),
+                                    "baseline_harness": copy.deepcopy(current_harness),
+                                    "chosen_harness": copy.deepcopy(chosen_harness),
+                                    "candidates": [
+                                        {
+                                            "alt_rank": item["alt_rank"],
+                                            "alt_token_text": item["alt_token_text"],
+                                            "strategy": item.get("strategy"),
+                                            "avg_risk": item["avg_risk"],
+                                            "max_risk": item["max_risk"],
+                                            "claim_risk": item.get("harness_risk"),
+                                            "claim_label": (item.get("harness") or {}).get("label"),
+                                            "accepted": item.get("strategy") == best.get("strategy") and item.get("alt_rank") == best.get("alt_rank"),
+                                        }
+                                        for item in ranked_candidates
+                                    ],
+                                }
+                            )
+                            update_status(
+                                f"Accepted {best.get('strategy', 'candidate').replace('_', ' ')} and moved to pass {len(interventions) + 1}.",
+                                phase="corrected",
+                                rewrite_pass=len(interventions) + 1,
+                                accepted_rewrites=len(interventions),
+                                loop_budget=policy["correction_loops"],
+                            )
+                            progress(
+                                "live_experiment_intervention",
+                                {
+                                    "rollback_index": rollback_index,
+                                    "trigger_index": trigger_index,
+                                    "baseline_avg_risk": current_avg_risk,
+                                    "chosen_alt_rank": best["alt_rank"],
+                                    "chosen_alt_text": best["alt_token_text"],
+                                    "chosen_strategy": best.get("strategy"),
+                                    "chosen_avg_risk": best["avg_risk"],
+                                    "chosen_max_risk": best["max_risk"],
+                                    "baseline_claim_risk": current_harness.get("claim_risk"),
+                                    "baseline_claim_label": current_harness.get("label"),
+                                    "baseline_claim": current_harness.get("standalone_claim") or ((current_harness.get("claim") or {}).get("text")),
+                                    "chosen_claim_risk": chosen_harness.get("claim_risk"),
+                                    "chosen_claim_label": chosen_harness.get("label"),
+                                    "chosen_claim": chosen_harness.get("standalone_claim") or ((chosen_harness.get("claim") or {}).get("text")),
+                                    "candidates": [
+                                        {
+                                            "alt_rank": item["alt_rank"],
+                                            "alt_token_text": item["alt_token_text"],
+                                            "strategy": item.get("strategy"),
+                                            "avg_risk": item["avg_risk"],
+                                            "max_risk": item["max_risk"],
+                                            "claim_risk": item.get("harness_risk"),
+                                            "claim_label": (item.get("harness") or {}).get("label"),
+                                            "accepted": item.get("strategy") == best.get("strategy") and item.get("alt_rank") == best.get("alt_rank"),
+                                        }
+                                        for item in ranked_candidates
+                                    ],
+                                    "corrected_text": joined_run_text(corrected),
+                                    "corrected_run_id": corrected["run_id"],
+                                    "corrected_run": copy.deepcopy(corrected),
+                                    "rewrite_pass": len(interventions) + 1,
+                                    "accepted_rewrites": len(interventions),
+                                    "loop_budget": policy["correction_loops"],
+                                    "baseline_harness": copy.deepcopy(current_harness),
+                                    "chosen_harness": copy.deepcopy(chosen_harness),
+                                },
+                            )
+                            last_intervention_index = len(corrected["tokens"]) - 1
+                        else:
+                            update_status(
+                                "No candidate cleared the current acceptance gates; continuing replay path.",
+                                phase="corrected",
+                                rewrite_pass=rewrite_pass,
+                                accepted_rewrites=len(interventions),
+                                loop_budget=policy["correction_loops"],
+                            )
+
+            if stop_info.get("hard_stop"):
+                break
+            if stop_info.get("stop") and remaining <= 0:
+                break
+
+        finalize_completed_run(corrected, started, status="complete")
+        corrected.setdefault("meta", {}).setdefault("live_experiment", {})
+        corrected["meta"]["live_experiment"]["had_intervention"] = bool(interventions)
+        corrected["meta"]["live_experiment"]["comparison_role"] = "corrected" if interventions else "replay_sample"
+        if not interventions:
+            corrected["meta"]["label"] = "Replay"
+        corrected.setdefault("analysis", {})["interventions"] = copy.deepcopy(interventions)
+
+        def final_harness_progress(payload, target_name, run_id):
+            update_status(
+                f"Final {target_name} evidence pass. {describe_harness_stage(payload)}",
+                phase="finalize",
+                target=target_name,
+                rewrite_pass=len(interventions) + 1,
+                accepted_rewrites=len(interventions),
+                loop_budget=policy["correction_loops"],
+            )
+            progress(
+                "live_experiment_harness",
+                {
+                    "phase": "finalize",
+                    "run_id": run_id,
+                    "target": target_name,
+                    "rewrite_pass": len(interventions) + 1,
+                    "accepted_rewrites": len(interventions),
+                    "loop_budget": policy["correction_loops"],
+                    **payload,
+                },
+            )
+
+        update_status("Running final baseline evidence pass.", phase="finalize", target="baseline")
+        baseline_harness = run_claim_harness(
+            baseline,
+            peak_risk_token_index(baseline),
+            policy,
+            progress_cb=lambda payload: final_harness_progress(payload, "baseline", baseline["run_id"]),
+            progress_context={"run_id": baseline["run_id"]},
+        )
+        update_status("Running final corrected evidence pass.", phase="finalize", target="corrected")
+        corrected_harness = run_claim_harness(
+            corrected,
+            peak_risk_token_index(corrected),
+            policy,
+            progress_cb=lambda payload: final_harness_progress(payload, "corrected", corrected["run_id"]),
+            progress_context={"run_id": corrected["run_id"]},
+        )
+        baseline.setdefault("analysis", {})["focus_claim"] = copy.deepcopy(baseline_harness)
+        corrected.setdefault("analysis", {})["focus_claim"] = copy.deepcopy(corrected_harness)
+
+        with RUNS_LOCK:
+            RUNS[baseline["run_id"]] = copy.deepcopy(baseline)
+            RUNS[corrected["run_id"]] = copy.deepcopy(corrected)
+            if baseline["run_id"] not in RUN_ORDER:
+                RUN_ORDER.append(baseline["run_id"])
+            if corrected["run_id"] not in RUN_ORDER:
+                RUN_ORDER.append(corrected["run_id"])
+
+        update_status("Packaging final experiment result.", phase="finalize", target="result")
+        return {
+            "mode": "prefix_replay",
+            "baseline_run_id": baseline["run_id"],
+            "corrected_run_id": corrected["run_id"],
+            "baseline": baseline,
+            "corrected": corrected,
+            "interventions": interventions,
+            "harness": {
+                "baseline": baseline_harness,
+                "corrected": corrected_harness,
+            },
+            "policy": policy,
+            "metrics": {
+                "baseline_max_risk": baseline.get("summary", {}).get("decoder_risk_max"),
+                "corrected_max_risk": corrected.get("summary", {}).get("decoder_risk_max"),
+                "baseline_alerts": baseline.get("summary", {}).get("decoder_alert_count"),
+                "corrected_alerts": corrected.get("summary", {}).get("decoder_alert_count"),
+                "baseline_claim_risk": baseline_harness.get("claim_risk") if isinstance(baseline_harness, dict) else None,
+                "corrected_claim_risk": corrected_harness.get("claim_risk") if isinstance(corrected_harness, dict) else None,
+                "intervention_count": len(interventions),
+                "correction_loops": policy["correction_loops"],
+                "rewrite_passes": len(interventions) + 1,
+            },
+        }
+    finally:
+        heartbeat_stop.set()
 
 
 class TelemetryHandler(SimpleHTTPRequestHandler):

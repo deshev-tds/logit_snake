@@ -58,7 +58,7 @@
         <label>Lookahead
           <input id="branch-lookahead-input" type="number" min="1" max="24" value="6" />
         </label>
-        <label>Max Interventions
+        <label>Correction Loops
           <input id="max-interventions-input" type="number" min="0" max="8" value="2" />
         </label>
       </div>
@@ -107,6 +107,8 @@
             <div class="kv"><span>Max Risk</span><strong id="corrected-risk">-</strong></div>
             <div class="kv"><span>Alerts</span><strong id="corrected-alerts">-</strong></div>
             <div class="kv"><span>Tokens</span><strong id="corrected-tokens">-</strong></div>
+            <div id="corrected-pass-note" class="token-note">Current replay/rewrite pass will appear here.</div>
+            <div id="corrected-pass-log" class="pass-log empty-list">No rewrite pass has been accepted yet.</div>
             <div class="token-note">Hover tokens for telemetry. Peak-risk token is highlighted in red.</div>
             <div id="corrected-text" class="text-block">-</div>
           </section>

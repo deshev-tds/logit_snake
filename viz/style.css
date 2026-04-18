@@ -513,6 +513,18 @@ kbd {
   font-size: 11px;
 }
 
+.pass-log {
+  margin: 0 0 8px;
+  padding: 8px 10px;
+  border: 1px dashed #d2dfec;
+  border-radius: 10px;
+  background: #f8fbfe;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+
 .tokenized-output {
   cursor: default;
 }

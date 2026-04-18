@@ -31,6 +31,8 @@ const ui = {
   correctedRisk: document.getElementById('corrected-risk'),
   correctedAlerts: document.getElementById('corrected-alerts'),
   correctedTokens: document.getElementById('corrected-tokens'),
+  correctedPassNote: document.getElementById('corrected-pass-note'),
+  correctedPassLog: document.getElementById('corrected-pass-log'),
   correctedText: document.getElementById('corrected-text'),
   tokenTooltip: document.getElementById('live-token-tooltip'),
 
@@ -62,6 +64,13 @@ const state = {
   lastResult: null,
   currentExperimentId: null,
   partialInterventions: [],
+  partialRuns: {
+    baseline: null,
+    corrected: null,
+    rewritePreview: null,
+  },
+  passLog: [],
+  loopBudget: 0,
   hoverToken: null,
 };
 
@@ -168,6 +177,84 @@ function peakRiskIndex(run) {
     }
   }
   return bestIndex;
+}
+
+function emptyPartialRun(runId = '') {
+  return {
+    run_id: runId || null,
+    tokens: [],
+    summary: {
+      token_count: 0,
+      decoder_alert_count: 0,
+      decoder_risk_max: null,
+    },
+  };
+}
+
+function syncPartialRunSummary(run, overrides = {}) {
+  if (!run || typeof run !== 'object') return null;
+  const tokens = Array.isArray(run.tokens) ? run.tokens.filter(Boolean) : [];
+  let maxRisk = null;
+  let alertCount = 0;
+  tokens.forEach((token) => {
+    const risk = tokenRiskValue(token);
+    if (risk == null) return;
+    if (maxRisk == null || risk > maxRisk) maxRisk = risk;
+    if (risk >= 0.64) alertCount += 1;
+  });
+  run.tokens = tokens;
+  run.summary = {
+    ...(run.summary || {}),
+    token_count: overrides.token_count ?? tokens.length,
+    decoder_alert_count: overrides.alert_count ?? alertCount,
+    decoder_risk_max: overrides.max_decoder_risk ?? maxRisk,
+  };
+  return run;
+}
+
+function ensurePartialRun(phase, runId) {
+  const existing = state.partialRuns[phase];
+  if (!existing || (runId && existing.run_id && existing.run_id !== runId)) {
+    state.partialRuns[phase] = emptyPartialRun(runId);
+  }
+  if (runId) state.partialRuns[phase].run_id = runId;
+  return state.partialRuns[phase];
+}
+
+function applyProgressToken(phase, event) {
+  const run = ensurePartialRun(phase, event?.run_id);
+  const token = event?.token && typeof event.token === 'object'
+    ? { ...event.token }
+    : {
+        index: asNumber(event?.token_index, run.tokens.length),
+        text: event?.token_text || '',
+        decoder_risk: asNumber(event?.decoder_risk),
+      };
+  const tokenIndex = Number.isInteger(token?.index) ? token.index : asNumber(event?.token_index, run.tokens.length);
+  const replaceIndex = Number.isInteger(tokenIndex) && tokenIndex >= 0 ? tokenIndex : run.tokens.length;
+  if (replaceIndex < run.tokens.length) {
+    run.tokens[replaceIndex] = token;
+  } else {
+    run.tokens.push(token);
+  }
+  syncPartialRunSummary(run, {
+    token_count: event?.token_count,
+    alert_count: event?.alert_count,
+    max_decoder_risk: event?.max_decoder_risk,
+  });
+  return run;
+}
+
+function applyRunSnapshot(phase, snapshot) {
+  if (!snapshot || typeof snapshot !== 'object') return null;
+  const run = {
+    ...snapshot,
+    tokens: Array.isArray(snapshot.tokens) ? snapshot.tokens.filter(Boolean).map((token) => ({ ...token })) : [],
+    summary: { ...(snapshot.summary || {}) },
+  };
+  syncPartialRunSummary(run);
+  state.partialRuns[phase] = run;
+  return run;
 }
 
 function displayTokenText(text) {
@@ -307,6 +394,43 @@ function renderRunTokens(container, run, fallbackText = '-') {
   });
 }
 
+function renderPassLog() {
+  if (!ui.correctedPassLog) return;
+  if (!state.passLog.length) {
+    ui.correctedPassLog.classList.add('empty-list');
+    ui.correctedPassLog.textContent = 'No rewrite pass has been accepted yet.';
+    return;
+  }
+  ui.correctedPassLog.classList.remove('empty-list');
+  ui.correctedPassLog.textContent = state.passLog.join('\n');
+}
+
+function appendPassLog(line) {
+  const text = String(line || '').trim();
+  if (!text) return;
+  if (state.passLog[state.passLog.length - 1] === text) return;
+  state.passLog.push(text);
+  renderPassLog();
+}
+
+function setCorrectedPassState({ rewritePass = 1, acceptedRewrites = 0, loopBudget = state.loopBudget, reason = '' } = {}) {
+  state.loopBudget = asNumber(loopBudget, state.loopBudget) ?? 0;
+  const maxPasses = 1 + Math.max(0, Number(state.loopBudget || 0));
+  const suffix = reason ? ` ${reason}` : '';
+  ui.correctedPassNote.textContent =
+    `Current pass ${rewritePass} of ${maxPasses}. Accepted rewrites ${acceptedRewrites}/${Math.max(0, Number(state.loopBudget || 0))}.${suffix}`;
+}
+
+function renderCorrectedPanelFromRun(run, { title = null } = {}) {
+  if (!run) return;
+  if (title) ui.correctedTitle.textContent = title;
+  ui.correctedRunId.textContent = run?.run_id || ui.correctedRunId.textContent;
+  ui.correctedTokens.textContent = String(run?.summary?.token_count ?? ui.correctedTokens.textContent);
+  ui.correctedRisk.textContent = formatPercent(run?.summary?.decoder_risk_max, 0);
+  ui.correctedAlerts.textContent = String(run?.summary?.decoder_alert_count ?? ui.correctedAlerts.textContent);
+  renderRunTokens(ui.correctedText, run, '-');
+}
+
 function renderBackend() {
   const info = state.backendInfo;
   ui.backendReachable.textContent = info ? (info.reachable ? 'yes' : 'no') : 'not probed';
@@ -366,7 +490,8 @@ function renderInterventions(result) {
     summary.textContent =
       `decoder avg ${formatPercent(item.baseline_avg_risk, 0)} -> ${formatPercent(item.chosen_avg_risk, 0)} | `
       + `claim ${formatPercent(item.baseline_claim_risk, 0)} -> ${formatPercent(item.chosen_claim_risk, 0)} `
-      + `via alt ${item.chosen_alt_rank + 1} (${displayTokenText(item.chosen_alt_text)})`;
+      + `via ${String(item.chosen_strategy || 'candidate').replace(/_/g, ' ')} `
+      + `${item.chosen_alt_rank >= 0 ? `alt ${item.chosen_alt_rank + 1}` : ''} (${displayTokenText(item.chosen_alt_text)})`;
     block.appendChild(summary);
 
     const candidates = document.createElement('div');
@@ -374,7 +499,8 @@ function renderInterventions(result) {
     candidates.textContent = (item.candidates || [])
       .map((candidate) => {
         const accepted = candidate.accepted ? 'accepted' : 'candidate';
-        return `#${candidate.alt_rank + 1} ${accepted} | ${displayTokenText(candidate.alt_token_text)} | avg risk ${formatPercent(candidate.avg_risk, 0)} | claim ${formatPercent(candidate.claim_risk, 0)} | ${candidate.claim_label || 'no harness'}`;
+        const rank = candidate.alt_rank >= 0 ? `#${candidate.alt_rank + 1}` : '[rewrite]';
+        return `${rank} ${accepted} | ${String(candidate.strategy || 'candidate').replace(/_/g, ' ')} | ${displayTokenText(candidate.alt_token_text)} | avg risk ${formatPercent(candidate.avg_risk, 0)} | claim ${formatPercent(candidate.claim_risk, 0)} | ${candidate.claim_label || 'no harness'}`;
       })
       .join('\n');
     block.appendChild(candidates);
@@ -441,6 +567,9 @@ function renderHarness(result) {
 function resetExperimentView() {
   state.lastResult = null;
   state.partialInterventions = [];
+  state.partialRuns = { baseline: null, corrected: null, rewritePreview: null };
+  state.passLog = [];
+  state.loopBudget = 0;
   hideTokenTooltip();
   ui.experimentMeta.textContent = 'Experiment is running...';
   ui.experimentSummary.textContent = 'Waiting for the first token-level updates from the live experiment loop.';
@@ -454,6 +583,9 @@ function resetExperimentView() {
   ui.correctedRisk.textContent = '-';
   ui.correctedAlerts.textContent = '-';
   ui.correctedTokens.textContent = '-';
+  ui.correctedPassNote.textContent = 'Current replay/rewrite pass will appear here.';
+  ui.correctedPassLog.textContent = 'No rewrite pass has been accepted yet.';
+  ui.correctedPassLog.classList.add('empty-list');
   ui.correctedText.classList.remove('tokenized-output');
   ui.correctedText.textContent = '-';
   ui.interventionCount.textContent = '0';
@@ -476,17 +608,37 @@ function renderPartialInterventions() {
 function updateProgress(event) {
   const phase = event?.phase;
   if (phase === 'baseline') {
+    const run = applyProgressToken('baseline', event);
     ui.baselineRunId.textContent = event.run_id || ui.baselineRunId.textContent;
-    ui.baselineTokens.textContent = String(event.token_count ?? ui.baselineTokens.textContent);
-    ui.baselineRisk.textContent = formatPercent(event.decoder_risk, 0);
-    ui.baselineText.textContent = event.text || ui.baselineText.textContent;
+    ui.baselineTokens.textContent = String(run?.summary?.token_count ?? event.token_count ?? ui.baselineTokens.textContent);
+    ui.baselineRisk.textContent = formatPercent(event.max_decoder_risk ?? run?.summary?.decoder_risk_max, 0);
+    ui.baselineAlerts.textContent = String(event.alert_count ?? run?.summary?.decoder_alert_count ?? ui.baselineAlerts.textContent);
+    renderRunTokens(ui.baselineText, run, event.text || ui.baselineText.textContent);
     setStatus(`Baseline token ${event.token_index + 1}`, 'neutral');
   } else if (phase === 'corrected') {
-    ui.correctedRunId.textContent = event.run_id || ui.correctedRunId.textContent;
-    ui.correctedTokens.textContent = String(event.token_count ?? ui.correctedTokens.textContent);
-    ui.correctedRisk.textContent = formatPercent(event.decoder_risk, 0);
-    ui.correctedText.textContent = event.text || ui.correctedText.textContent;
-    setStatus(`Corrected token ${event.token_index + 1}`, 'neutral');
+    const run = applyProgressToken('corrected', event);
+    renderCorrectedPanelFromRun(run, {
+      title: Number(event.accepted_rewrites ?? 0) > 0 ? 'Corrected Candidate' : 'Replay Sample',
+    });
+    setCorrectedPassState({
+      rewritePass: asNumber(event.rewrite_pass, 1),
+      acceptedRewrites: asNumber(event.accepted_rewrites, 0),
+      loopBudget: asNumber(event.loop_budget, state.loopBudget),
+      reason: Number(event.accepted_rewrites ?? 0) > 0
+        ? 'Current text reflects the latest accepted rewrite pass.'
+        : 'Current text reflects the live replay path.',
+    });
+    setStatus(`Corrected token ${event.token_index + 1} on pass ${event.rewrite_pass ?? 1}`, 'neutral');
+  } else if (phase === 'rewrite_candidate') {
+    const run = applyProgressToken('rewritePreview', event);
+    renderCorrectedPanelFromRun(run, { title: 'Rewrite Preview' });
+    setCorrectedPassState({
+      rewritePass: asNumber(event.rewrite_pass, 1),
+      acceptedRewrites: asNumber(event.accepted_rewrites, 0),
+      loopBudget: asNumber(event.loop_budget, state.loopBudget),
+      reason: 'Evaluating a conservative rewrite candidate before acceptance.',
+    });
+    setStatus(`Rewrite preview token ${event.token_index + 1} on pass ${event.rewrite_pass ?? 1}`, 'neutral');
   }
 }
 
@@ -512,9 +664,16 @@ function connectStream() {
     if (!payload.experiment_id || payload.experiment_id !== state.currentExperimentId) return;
 
     if (payload.type === 'live_experiment_started') {
+      state.loopBudget = asNumber(payload.correction_loops, 0) ?? 0;
+      state.passLog = ['Pass 1 started from the raw replay path.'];
+      renderPassLog();
+      setCorrectedPassState({ rewritePass: 1, acceptedRewrites: 0, loopBudget: state.loopBudget });
+      ui.correctedTitle.textContent = 'Replay Sample';
       ui.baselineRunId.textContent = payload.baseline_run_id || '-';
       ui.correctedRunId.textContent = payload.corrected_run_id || '-';
-      ui.experimentMeta.textContent = `Mode=${payload.mode || 'prefix_replay'} | baseline=${payload.baseline_run_id || '-'} | corrected=${payload.corrected_run_id || '-'}`;
+      ui.experimentMeta.textContent =
+        `Mode=${payload.mode || 'prefix_replay'} | correction_loops=${payload.correction_loops ?? 0} | `
+        + `baseline=${payload.baseline_run_id || '-'} | corrected=${payload.corrected_run_id || '-'}`;
       return;
     }
 
@@ -523,27 +682,105 @@ function connectStream() {
       return;
     }
 
+    if (payload.type === 'live_experiment_status') {
+      const waiting = asNumber(payload.waiting_ms, 0);
+      const seconds = waiting >= 1000 ? ` (${(waiting / 1000).toFixed(waiting >= 10000 ? 0 : 1)}s)` : '';
+      if (payload.message) {
+        setStatus(`${payload.message}${seconds}`, 'neutral');
+      }
+      if (payload.phase === 'rewrite_candidate') {
+        setCorrectedPassState({
+          rewritePass: asNumber(payload.rewrite_pass, 1),
+          acceptedRewrites: asNumber(payload.accepted_rewrites, 0),
+          loopBudget: asNumber(payload.loop_budget, state.loopBudget),
+          reason: payload.message || 'Evaluating a rewrite candidate.',
+        });
+      }
+      return;
+    }
+
     if (payload.type === 'live_experiment_harness') {
-      const claim = payload.claim_text || 'pending claim extraction';
-      const label = payload.label ? payload.label.replace(/-/g, ' ') : (payload.status || 'pending').replace(/_/g, ' ');
-      ui.harnessSummary.textContent =
-        `Harness checked claim near token ${payload.rollback_index ?? '-'}: ${label}`
-        + (payload.claim_risk != null ? ` (${formatPercent(payload.claim_risk, 0)})` : '')
-        + `. ${claim}`;
-      setStatus(`Evaluating risky claim near token ${payload.rollback_index}`, 'neutral');
+      if (payload.stage) {
+        const stage = String(payload.stage);
+        if (stage === 'probe_sample_completed') {
+          ui.harnessSummary.textContent =
+            `Probe ${Number(payload.probe_index ?? 0) + 1} sample ${payload.sample_index ?? '-'}: ${payload.answer_text || 'unknown'}`;
+        } else if (stage === 'judge_completed') {
+          ui.harnessSummary.textContent =
+            `Judged detail ${Number(payload.fact_index ?? 0) + 1}: ${(payload.verdict || 'uncertain').replace(/_/g, ' ')}`
+            + (payload.fact_risk != null ? ` (${formatPercent(payload.fact_risk, 0)})` : '');
+        } else if (stage === 'harness_completed') {
+          ui.harnessSummary.textContent =
+            `Harness checked claim near token ${payload.rollback_index ?? '-'}: ${(payload.label || 'pending').replace(/-/g, ' ')}`
+            + (payload.claim_risk != null ? ` (${formatPercent(payload.claim_risk, 0)})` : '')
+            + `. ${payload.claim_text || 'pending claim extraction'}`;
+        } else {
+          ui.harnessSummary.textContent = payload.claim_text || payload.message || 'Evaluating risky claim.';
+        }
+      } else {
+        const claim = payload.claim_text || 'pending claim extraction';
+        const label = payload.label ? payload.label.replace(/-/g, ' ') : (payload.status || 'pending').replace(/_/g, ' ');
+        ui.harnessSummary.textContent =
+          `Harness checked claim near token ${payload.rollback_index ?? '-'}: ${label}`
+          + (payload.claim_risk != null ? ` (${formatPercent(payload.claim_risk, 0)})` : '')
+          + `. ${claim}`;
+      }
+      return;
+    }
+
+    if (payload.type === 'live_experiment_candidate') {
+      if (payload.strategy === 'policy_rewrite') {
+        if (payload.stage === 'candidate_started') {
+          appendPassLog(`Pass ${payload.rewrite_pass ?? 1}: started conservative rewrite candidate.`);
+        } else if (payload.stage === 'candidate_completed') {
+          appendPassLog(
+            `Pass ${payload.rewrite_pass ?? 1}: rewrite candidate decoded with avg risk ${formatPercent(payload.avg_risk, 0)}.`
+          );
+        } else if (payload.stage === 'candidate_result' && payload.accepted === false) {
+          const restored = applyRunSnapshot('corrected', payload.current_corrected_run);
+          if (restored) {
+            renderCorrectedPanelFromRun(restored, {
+              title: Number(payload.accepted_rewrites ?? 0) > 0 ? 'Corrected Candidate' : 'Replay Sample',
+            });
+          }
+          setCorrectedPassState({
+            rewritePass: asNumber(payload.rewrite_pass, 1),
+            acceptedRewrites: asNumber(payload.accepted_rewrites, 0),
+            loopBudget: asNumber(payload.loop_budget, state.loopBudget),
+            reason: 'Rejected rewrite preview; returned to the current accepted path.',
+          });
+          appendPassLog(`Pass ${payload.rewrite_pass ?? 1}: rewrite candidate rejected; resumed current path.`);
+        }
+      }
       return;
     }
 
     if (payload.type === 'live_experiment_intervention') {
       state.partialInterventions.push(payload);
       renderPartialInterventions();
-      if (payload.corrected_text) {
+      if (payload.corrected_run) {
+        const run = applyRunSnapshot('corrected', payload.corrected_run);
+        renderCorrectedPanelFromRun(run, { title: 'Corrected Candidate' });
+      } else if (payload.corrected_text) {
         ui.correctedText.textContent = payload.corrected_text;
       }
+      ui.correctedTitle.textContent = 'Corrected Candidate';
+      setCorrectedPassState({
+        rewritePass: asNumber(payload.rewrite_pass, 2),
+        acceptedRewrites: asNumber(payload.accepted_rewrites, 1),
+        loopBudget: asNumber(payload.loop_budget, state.loopBudget),
+        reason: `Accepted rewrite at token ${payload.trigger_index} via alt ${Number(payload.chosen_alt_rank ?? 0) + 1}.`,
+      });
+      state.passLog.push(
+        `Pass ${payload.rewrite_pass ?? state.partialInterventions.length + 1}: accepted ${String(payload.chosen_strategy || 'candidate').replace(/_/g, ' ')} at token ${payload.trigger_index}. `
+        + `Decoder ${formatPercent(payload.baseline_avg_risk, 0)} -> ${formatPercent(payload.chosen_avg_risk, 0)} | `
+        + `claim ${formatPercent(payload.baseline_claim_risk, 0)} -> ${formatPercent(payload.chosen_claim_risk, 0)}.`
+      );
+      renderPassLog();
       if (payload.baseline_harness || payload.chosen_harness) {
         renderHarness({ harness: { baseline: payload.baseline_harness, corrected: payload.chosen_harness }, metrics: { intervention_count: 1 } });
       }
-      setStatus(`Intervention at token ${payload.trigger_index}`, 'neutral');
+      setStatus(`Accepted rewrite pass ${payload.rewrite_pass ?? 2} at token ${payload.trigger_index}`, 'neutral');
       return;
     }
 
@@ -565,29 +802,58 @@ function renderResult(result) {
   const baseline = result?.baseline;
   const corrected = result?.corrected;
   const interventionCount = Number(result?.metrics?.intervention_count ?? 0);
-  const correctedLabel = interventionCount > 0 ? 'Corrected' : 'Replay Sample';
+  const correctedLabel = interventionCount > 0 ? 'Corrected Candidate' : 'Replay Sample';
   ui.correctedTitle.textContent = correctedLabel;
 
-  ui.experimentMeta.textContent = `Mode=${result?.mode || '-'} | interventions=${result?.metrics?.intervention_count ?? 0} | baseline=${result?.baseline_run_id || '-'} | corrected=${result?.corrected_run_id || '-'}`;
+  if (!state.passLog.length) {
+    state.passLog = ['Pass 1 started from the raw replay path.'];
+  }
+  if (interventionCount > 0) {
+    const fromResult = (result?.interventions || []).map((item, idx) =>
+      `Pass ${idx + 2}: accepted ${String(item.chosen_strategy || 'candidate').replace(/_/g, ' ')} at token ${item.trigger_index}. `
+      + `Decoder ${formatPercent(item.baseline_avg_risk, 0)} -> ${formatPercent(item.chosen_avg_risk, 0)} | `
+      + `claim ${formatPercent(item.baseline_claim_risk, 0)} -> ${formatPercent(item.chosen_claim_risk, 0)}.`
+    );
+    state.passLog = ['Pass 1 started from the raw replay path.', ...fromResult];
+  } else {
+    state.passLog = ['Pass 1 completed as a matched replay sample. No rewrite was accepted.'];
+  }
+  renderPassLog();
+  setCorrectedPassState({
+    rewritePass: asNumber(result?.metrics?.rewrite_passes, 1),
+    acceptedRewrites: interventionCount,
+    loopBudget: asNumber(result?.metrics?.correction_loops, state.loopBudget),
+    reason: interventionCount > 0
+      ? 'Final panel shows the latest accepted rewrite candidate.'
+      : 'No rewrite cleared the acceptance gates, so the final panel remains a replay sample.',
+  });
+
+  ui.experimentMeta.textContent =
+    `Mode=${result?.mode || '-'} | correction_loops=${result?.metrics?.correction_loops ?? 0} | `
+    + `accepted_rewrites=${result?.metrics?.intervention_count ?? 0} | baseline=${result?.baseline_run_id || '-'} | corrected=${result?.corrected_run_id || '-'}`;
   if (interventionCount > 0) {
     ui.experimentSummary.textContent =
       `Baseline max risk ${formatPercent(result?.metrics?.baseline_max_risk, 0)} vs corrected ${formatPercent(result?.metrics?.corrected_max_risk, 0)}. `
       + `Claim risk: ${formatPercent(result?.metrics?.baseline_claim_risk, 0)} -> ${formatPercent(result?.metrics?.corrected_claim_risk, 0)}. `
       + `Alerts: ${result?.metrics?.baseline_alerts ?? '-'} -> ${result?.metrics?.corrected_alerts ?? '-'}. `
+      + `Accepted rewrites: ${result?.metrics?.intervention_count ?? 0}/${result?.metrics?.correction_loops ?? 0}. `
       + `Use "Open In Snake Scope" to inspect both trajectories in the main visualizer.`;
   } else {
     ui.experimentSummary.textContent =
       `No intervention fired. Baseline max risk ${formatPercent(result?.metrics?.baseline_max_risk, 0)} and replay max risk ${formatPercent(result?.metrics?.corrected_max_risk, 0)} are two matched decode samples, not evidence that a correction policy helped or hurt. `
       + `Claim risk is ${formatPercent(result?.metrics?.baseline_claim_risk, 0)} vs ${formatPercent(result?.metrics?.corrected_claim_risk, 0)}. `
+      + `Accepted rewrites: 0/${result?.metrics?.correction_loops ?? 0}. `
       + `Use "Open In Snake Scope" to inspect both trajectories in the main visualizer.`;
   }
 
+  applyRunSnapshot('baseline', baseline);
   ui.baselineRunId.textContent = baseline?.run_id || '-';
   ui.baselineRisk.textContent = formatPercent(baseline?.summary?.decoder_risk_max, 0);
   ui.baselineAlerts.textContent = String(baseline?.summary?.decoder_alert_count ?? '-');
   ui.baselineTokens.textContent = String(baseline?.summary?.token_count ?? '-');
   renderRunTokens(ui.baselineText, baseline, '-');
 
+  applyRunSnapshot('corrected', corrected);
   ui.correctedRunId.textContent = corrected?.run_id || '-';
   ui.correctedRisk.textContent = formatPercent(corrected?.summary?.decoder_risk_max, 0);
   ui.correctedAlerts.textContent = String(corrected?.summary?.decoder_alert_count ?? '-');
@@ -656,13 +922,14 @@ async function runExperiment() {
     rollback_buffer: asNumber(ui.rollbackBuffer.value, 1),
     branch_candidates: asNumber(ui.branchCandidates.value, 3),
     branch_lookahead: asNumber(ui.branchLookahead.value, 6),
+    correction_loops: asNumber(ui.maxInterventions.value, 2),
     max_interventions: asNumber(ui.maxInterventions.value, 2),
   };
 
   try {
     state.currentExperimentId = `exp_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`;
     resetExperimentView();
-    setStatus('Running baseline and corrected decode...', 'neutral');
+    setStatus('Running baseline and replay/rewrite loops...', 'neutral');
     const result = await apiPost('/api/live-experiment', {
       experiment_id: state.currentExperimentId,
       prompt,
