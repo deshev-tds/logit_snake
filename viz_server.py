@@ -1319,6 +1319,640 @@ def joined_run_text(run):
     return "".join((token.get("text") or "") for token in (run.get("tokens") or []))
 
 
+def token_char_spans(tokens):
+    spans = []
+    pos = 0
+    for token in tokens or []:
+        text = token.get("text") or ""
+        start = pos
+        end = start + len(text)
+        spans.append({"start": start, "end": end})
+        pos = end
+    return spans
+
+
+def strip_claim_prefix(text):
+    return re.sub(r"^\s*(?:[-*•]+|\d+[.)])\s*", "", str(text or "").strip())
+
+
+def sentence_claim_spans(text):
+    spans = []
+    start = 0
+    i = 0
+    closers = "\"')]}”’"
+    while i < len(text):
+        ch = text[i]
+        if ch in ".!?。！？":
+            end = i + 1
+            while end < len(text) and text[end] in closers:
+                end += 1
+            next_char = text[end] if end < len(text) else ""
+            if not next_char or next_char.isspace():
+                spans.append({"start": start, "end": end, "complete": True})
+                while end < len(text) and text[end].isspace():
+                    end += 1
+                start = end
+                i = end
+                continue
+        i += 1
+    if start < len(text):
+        spans.append({"start": start, "end": len(text), "complete": False})
+    return spans
+
+
+def extract_claim_spans(text):
+    text = str(text or "")
+    nonempty_lines = [line for line in text.splitlines() if line.strip()]
+    spans = []
+
+    if len(nonempty_lines) >= 2:
+        offset = 0
+        for raw_line in text.splitlines(True):
+            stripped = raw_line.strip()
+            if stripped:
+                local_start = raw_line.find(stripped)
+                start = offset + max(0, local_start)
+                end = start + len(stripped)
+                spans.append(
+                    {
+                        "start": start,
+                        "end": end,
+                        "complete": raw_line.endswith("\n") or bool(re.search(r"[.!?。！？][\"')\]}”’]*\s*$", stripped)),
+                    }
+                )
+            offset += len(raw_line)
+    else:
+        spans = sentence_claim_spans(text)
+
+    out = []
+    for span in spans:
+        raw_text = text[span["start"] : span["end"]]
+        trimmed = raw_text.strip()
+        if not trimmed:
+            continue
+        leading_trim = len(raw_text) - len(raw_text.lstrip())
+        adjusted_start = span["start"] + leading_trim
+        adjusted_end = adjusted_start + len(trimmed)
+        out.append(
+            {
+                "start": adjusted_start,
+                "end": adjusted_end,
+                "text": strip_claim_prefix(trimmed),
+                "complete": bool(span.get("complete")),
+            }
+        )
+    return out
+
+
+def claim_is_checkworthy(text):
+    claim = strip_claim_prefix(text)
+    normalized = re.sub(r"\s+", " ", claim).strip()
+    if not normalized:
+        return False
+    lowered = normalized.lower()
+    banned = (
+        "answer directly",
+        "the prompt",
+        "format:",
+        "constraint:",
+        "advanced logic",
+        "conversational filler",
+        "use open in snake scope",
+        "this response",
+        "the user asked",
+    )
+    if any(pat in lowered for pat in banned):
+        return False
+    words = re.findall(r"[A-Za-z0-9][A-Za-z0-9'_-]*", normalized)
+    if len(words) < 4 and not re.search(r"\d|\"|“|”|'", normalized):
+        return False
+    has_signal = (
+        bool(re.search(r"\d", normalized))
+        or bool(re.search(r"[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+", normalized))
+        or bool(re.search(r"\b(is|are|was|were|has|have|had|includes|published|located|founded|wrote|won)\b", lowered))
+        or bool(re.search(r"\"|“|”|ISBN|ISO|case\b|v\.", normalized))
+    )
+    return has_signal
+
+
+def map_claim_tokens(tokens, claim_span):
+    spans = token_char_spans(tokens)
+    token_start = None
+    token_end = None
+    for idx, span in enumerate(spans):
+        if span["end"] <= claim_span["start"]:
+            continue
+        if span["start"] >= claim_span["end"]:
+            break
+        if token_start is None:
+            token_start = idx
+        token_end = idx
+    return token_start, token_end
+
+
+def claim_for_token_index(run, focus_token_index, require_complete=True):
+    tokens = run.get("tokens") or []
+    if not tokens:
+        return None
+    focus_token_index = max(0, min(int(focus_token_index), len(tokens) - 1))
+    text = joined_run_text(run)
+    if not text:
+        return None
+    char_spans = token_char_spans(tokens)
+    focus_char = max(0, char_spans[focus_token_index]["end"] - 1)
+    candidates = []
+    for span in extract_claim_spans(text):
+        if require_complete and not span["complete"]:
+            continue
+        if span["start"] <= focus_char:
+            candidates.append(span)
+        elif span["start"] > focus_char:
+            break
+    if not candidates:
+        return None
+    best = None
+    for span in reversed(candidates):
+        if span["start"] <= focus_char < span["end"] and claim_is_checkworthy(span["text"]):
+            best = span
+            break
+    if best is None:
+        for span in reversed(candidates):
+            if claim_is_checkworthy(span["text"]):
+                best = span
+                break
+    if best is None:
+        best = candidates[-1]
+
+    token_start, token_end = map_claim_tokens(tokens, best)
+    claim = copy.deepcopy(best)
+    claim["token_start"] = token_start
+    claim["token_end"] = token_end
+    claim["checkworthy"] = claim_is_checkworthy(claim["text"])
+    return claim
+
+
+def probe_slot_for_settings(settings, offset):
+    base = sanitize_int((settings or {}).get("id_slot", 0), 0, minimum=0, maximum=8)
+    return min(8, max(0, base + offset))
+
+
+def completion_text_with_retry(base_url, prompt, max_tokens, settings, model_name=None):
+    response, used_model = completion_with_model_retry(base_url, prompt, max_tokens, settings, model_name)
+    return extract_content(response).strip(), used_model
+
+
+def extract_json_object(text):
+    text = str(text or "")
+    start = text.find("{")
+    while start != -1:
+        depth = 0
+        in_string = False
+        escaped = False
+        for idx in range(start, len(text)):
+            ch = text[idx]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    in_string = False
+                continue
+            if ch == '"':
+                in_string = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = text[start : idx + 1]
+                    try:
+                        return json.loads(candidate)
+                    except json.JSONDecodeError:
+                        break
+        start = text.find("{", start + 1)
+    return None
+
+
+def normalize_probe_answer(text):
+    answer = re.sub(r"\s+", " ", str(text or "")).strip()
+    if answer:
+        answer = answer.splitlines()[0].strip()
+    answer = re.sub(r"^(answer|response)\s*:\s*", "", answer, flags=re.IGNORECASE)
+    return answer.strip(" \"'`.,;:()[]{}")
+
+
+def heuristic_claim_probe_plan(claim, max_facts):
+    claim = strip_claim_prefix(claim)
+    facts = []
+    lowered = claim.lower()
+
+    isbn_match = re.search(r"\b(?:ISBN(?:-1[03])?\s*[:#]?\s*)?([0-9Xx][0-9Xx\-]{8,20})\b", claim)
+    if isbn_match:
+        facts.append({"fact": isbn_match.group(1), "kind": "number", "question": "What is the ISBN?"})
+
+    year_match = re.search(r"\b(1[5-9]\d{2}|20\d{2}|2100)\b", claim)
+    if year_match:
+        facts.append({"fact": year_match.group(1), "kind": "date", "question": "What year is mentioned?"})
+
+    label_match = re.match(r"^(Publisher|Author|Language|Publication Year|Quote|Direct Quotation)\s*:\s*(.+)$", claim, flags=re.IGNORECASE)
+    if label_match:
+        label = label_match.group(1).strip().lower()
+        value = label_match.group(2).strip().strip('"')
+        question_map = {
+            "publisher": "Who is the publisher?",
+            "author": "Who is the author?",
+            "language": "What is the language?",
+            "publication year": "What is the publication year?",
+            "quote": "What is the quoted line?",
+            "direct quotation": "What is the quoted line?",
+        }
+        facts.append(
+            {
+                "fact": value,
+                "kind": "quote" if "quote" in label else "other",
+                "question": question_map.get(label, f"What is the {label}?"),
+            }
+        )
+
+    quote_match = re.search(r"[\"“](.+?)[\"”]", claim)
+    if quote_match and len(quote_match.group(1)) >= 12:
+        facts.append({"fact": quote_match.group(1).strip(), "kind": "quote", "question": "What is the quoted line?"})
+
+    title_match = re.search(r"(?:monograph|book|paper|case|standard)\s+[\"“]([^\"”]+)[\"”]", lowered)
+    if title_match:
+        facts.append({"fact": title_match.group(1).strip(), "kind": "title", "question": "What is the title mentioned?"})
+
+    person_match = re.search(r"\b(?:Prof\.|Professor|Dr\.)?\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b", claim)
+    if person_match and all(item["fact"] != person_match.group(1).strip() for item in facts):
+        facts.append({"fact": person_match.group(1).strip(), "kind": "person", "question": "Which person is named in the claim?"})
+
+    deduped = []
+    seen = set()
+    for item in facts:
+        key = (item["fact"].strip().lower(), item["question"].strip().lower())
+        if not item["fact"] or not item["question"] or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+        if len(deduped) >= max_facts:
+            break
+
+    return {
+        "checkworthy": claim_is_checkworthy(claim) and bool(deduped),
+        "standalone_claim": claim,
+        "facts": deduped,
+        "raw_response": "",
+        "model": None,
+    }
+
+
+def build_claim_probe_plan(base_url, model_name, settings, claim, context_text, policy):
+    prompt = (
+        "You are preparing factual probes for a generated claim.\n"
+        "Return JSON only with this schema:\n"
+        '{"checkworthy": true, "standalone_claim": "...", "facts": [{"fact": "...", "kind": "person|org|date|number|title|location|quote|other", "question": "..."}]}\n'
+        "Rules:\n"
+        "- Keep only explicit factual details already present in the claim.\n"
+        "- If the claim depends on pronouns, rewrite it as a standalone claim using only the provided context.\n"
+        "- If the claim is mostly stylistic, subjective, or instruction-following, set checkworthy to false and facts to [].\n"
+        "- Do not use markdown fences or commentary.\n"
+        f"- Return at most {policy['harness_max_facts']} facts.\n"
+        "Context:\n"
+        f"{context_text or '[none]'}\n\n"
+        "Claim:\n"
+        f"{claim}\n"
+    )
+    probe_settings = copy.deepcopy(settings)
+    probe_settings["temperature"] = 0.15
+    probe_settings["top_p"] = 0.9
+    probe_settings["seed"] = stable_seed(prompt, probe_settings.get("seed", 0), "claim-plan")
+    probe_settings["id_slot"] = probe_slot_for_settings(settings, 1)
+    raw_text, used_model = completion_text_with_retry(
+        base_url,
+        prompt,
+        policy["harness_json_tokens"],
+        probe_settings,
+        model_name=model_name,
+    )
+    parsed = extract_json_object(raw_text) or {}
+    facts = parsed.get("facts") if isinstance(parsed.get("facts"), list) else []
+    clean_facts = []
+    for item in facts[: policy["harness_max_facts"]]:
+        if not isinstance(item, dict):
+            continue
+        fact = str(item.get("fact") or "").strip()
+        question = str(item.get("question") or "").strip()
+        if not fact or not question:
+            continue
+        clean_facts.append(
+            {
+                "fact": fact,
+                "kind": str(item.get("kind") or "other").strip().lower(),
+                "question": question,
+            }
+        )
+    standalone_claim = str(parsed.get("standalone_claim") or claim).strip() or claim
+    checkworthy = bool(parsed.get("checkworthy")) if "checkworthy" in parsed else claim_is_checkworthy(standalone_claim)
+    plan = {
+        "checkworthy": checkworthy and bool(clean_facts),
+        "standalone_claim": standalone_claim,
+        "facts": clean_facts,
+        "raw_response": raw_text,
+        "model": used_model,
+    }
+    if not plan["facts"]:
+        fallback = heuristic_claim_probe_plan(standalone_claim, policy["harness_max_facts"])
+        if fallback["facts"]:
+            fallback["raw_response"] = raw_text
+            fallback["model"] = used_model
+            return fallback
+    return plan
+
+
+def run_probe_answers(base_url, model_name, settings, question, policy, probe_index):
+    answers = []
+    for sample_index in range(policy["harness_samples"]):
+        prompt = (
+            "Answer the factual question with a short phrase only.\n"
+            'If the answer is unknown or unstable, answer exactly: unknown\n'
+            f"Question: {question}\n"
+            "Answer:"
+        )
+        probe_settings = copy.deepcopy(settings)
+        probe_settings["temperature"] = max(0.75, float(settings.get("temperature") or 0.7))
+        probe_settings["top_p"] = max(0.9, float(settings.get("top_p") or 0.95))
+        probe_settings["seed"] = stable_seed(settings.get("seed", 0), question, probe_index, sample_index)
+        probe_settings["id_slot"] = probe_slot_for_settings(settings, 1)
+        raw_text, model_name = completion_text_with_retry(
+            base_url,
+            prompt,
+            policy["harness_probe_tokens"],
+            probe_settings,
+            model_name=model_name,
+        )
+        answers.append({"raw": raw_text, "text": normalize_probe_answer(raw_text) or "unknown"})
+    return answers, model_name
+
+
+def judge_probe_fact(base_url, model_name, settings, claim, fact_detail, question, answers, policy, fact_index):
+    prompt = (
+        "You are checking whether a factual detail from a generated claim is stable.\n"
+        'Return JSON only with this schema: {"verdict":"supported|conflict|uncertain","agreement":"high|mixed|low","canonical_answer":"...","reason":"..."}\n'
+        "Rules:\n"
+        "- supported: the answers agree and support the original fact detail.\n"
+        "- conflict: the answers disagree with the fact detail or clearly contradict each other.\n"
+        "- uncertain: the answers are vague, say unknown, or do not reliably support the fact detail.\n"
+        "- Keep reason short.\n\n"
+        f"Standalone claim: {claim}\n"
+        f"Fact detail: {fact_detail}\n"
+        f"Probe question: {question}\n"
+        f"Answer 1: {answers[0]['text'] if len(answers) > 0 else 'unknown'}\n"
+        f"Answer 2: {answers[1]['text'] if len(answers) > 1 else 'unknown'}\n"
+    )
+    probe_settings = copy.deepcopy(settings)
+    probe_settings["temperature"] = 0.1
+    probe_settings["top_p"] = 0.9
+    probe_settings["seed"] = stable_seed(settings.get("seed", 0), fact_detail, fact_index, "judge")
+    probe_settings["id_slot"] = probe_slot_for_settings(settings, 1)
+    raw_text, used_model = completion_text_with_retry(
+        base_url,
+        prompt,
+        policy["harness_json_tokens"],
+        probe_settings,
+        model_name=model_name,
+    )
+    parsed = extract_json_object(raw_text) or {}
+    verdict = str(parsed.get("verdict") or "uncertain").strip().lower()
+    if verdict not in ("supported", "conflict", "uncertain"):
+        verdict = "uncertain"
+    agreement = str(parsed.get("agreement") or "mixed").strip().lower()
+    if agreement not in ("high", "mixed", "low"):
+        agreement = "mixed"
+    canonical = normalize_probe_answer(parsed.get("canonical_answer") or "")
+    reason = str(parsed.get("reason") or "").strip()
+
+    if verdict == "supported":
+        fact_risk = {"high": 0.14, "mixed": 0.24, "low": 0.32}[agreement]
+    elif verdict == "conflict":
+        fact_risk = {"high": 0.88, "mixed": 0.84, "low": 0.8}[agreement]
+    else:
+        if all((ans.get("text") or "").lower() == "unknown" for ans in answers):
+            fact_risk = 0.52
+        else:
+            fact_risk = {"high": 0.46, "mixed": 0.58, "low": 0.68}[agreement]
+
+    return {
+        "verdict": verdict,
+        "agreement": agreement,
+        "canonical_answer": canonical or None,
+        "reason": reason,
+        "fact_risk": fact_risk,
+        "raw_response": raw_text,
+        "model": used_model,
+    }
+
+
+def run_claim_harness(run, focus_token_index, policy):
+    tokens = run.get("tokens") or []
+    if not tokens:
+        return {"status": "no_tokens"}
+
+    focus_token_index = max(0, min(int(focus_token_index), len(tokens) - 1))
+    cache = run.setdefault("analysis", {}).setdefault("claim_harness_cache", {})
+    cache_key = str(focus_token_index)
+    cached = cache.get(cache_key)
+    if isinstance(cached, dict):
+        return copy.deepcopy(cached)
+
+    claim_span = claim_for_token_index(run, focus_token_index, require_complete=True)
+    if claim_span is None:
+        result = {"status": "no_complete_claim", "focus_token_index": focus_token_index}
+        cache[cache_key] = copy.deepcopy(result)
+        return result
+
+    base_url = run.get("meta", {}).get("base_url", DEFAULTS["base_url"])
+    settings = copy.deepcopy(run.get("meta", {}).get("generation_settings") or {})
+    model_name = run.get("meta", {}).get("model")
+    text = joined_run_text(run)
+    context_start = max(0, claim_span["start"] - 280)
+    context_text = text[context_start : claim_span["start"]].strip()
+
+    if not claim_span.get("checkworthy"):
+        result = {
+            "status": "not_checkworthy",
+            "focus_token_index": focus_token_index,
+            "claim": claim_span,
+        }
+        cache[cache_key] = copy.deepcopy(result)
+        return result
+
+    plan = build_claim_probe_plan(base_url, model_name, settings, claim_span["text"], context_text, policy)
+    if not plan.get("checkworthy") or not plan.get("facts"):
+        result = {
+            "status": "not_checkworthy",
+            "focus_token_index": focus_token_index,
+            "claim": claim_span,
+            "plan": plan,
+        }
+        cache[cache_key] = copy.deepcopy(result)
+        return result
+
+    facts = []
+    current_model = plan.get("model") or model_name
+    for fact_index, item in enumerate(plan["facts"]):
+        answers, current_model = run_probe_answers(
+            base_url,
+            current_model,
+            settings,
+            item["question"],
+            policy,
+            fact_index,
+        )
+        judgement = judge_probe_fact(
+            base_url,
+            current_model,
+            settings,
+            plan["standalone_claim"],
+            item["fact"],
+            item["question"],
+            answers,
+            policy,
+            fact_index,
+        )
+        current_model = judgement.get("model") or current_model
+        facts.append(
+            {
+                "fact": item["fact"],
+                "kind": item["kind"],
+                "question": item["question"],
+                "answers": answers,
+                "judgement": judgement,
+            }
+        )
+
+    fact_risks = [float(f["judgement"]["fact_risk"]) for f in facts if f.get("judgement")]
+    max_risk = max(fact_risks) if fact_risks else None
+    mean_risk = (sum(fact_risks) / len(fact_risks)) if fact_risks else None
+    claim_risk = None
+    if fact_risks:
+        claim_risk = max(0.0, min(1.0, 0.65 * max_risk + 0.35 * mean_risk))
+
+    supported = sum(1 for f in facts if f["judgement"]["verdict"] == "supported")
+    conflicted = sum(1 for f in facts if f["judgement"]["verdict"] == "conflict")
+    uncertain = sum(1 for f in facts if f["judgement"]["verdict"] == "uncertain")
+    if claim_risk is None:
+        label = "no-evidence"
+    elif claim_risk >= 0.72:
+        label = "likely-unsupported"
+    elif claim_risk >= 0.5:
+        label = "unstable"
+    else:
+        label = "mostly-supported"
+
+    result = {
+        "status": "ok",
+        "focus_token_index": focus_token_index,
+        "claim": claim_span,
+        "standalone_claim": plan["standalone_claim"],
+        "plan": plan,
+        "facts": facts,
+        "supported_facts": supported,
+        "conflicted_facts": conflicted,
+        "uncertain_facts": uncertain,
+        "claim_risk": claim_risk,
+        "label": label,
+    }
+    cache[cache_key] = copy.deepcopy(result)
+    return result
+
+
+def peak_risk_token_index(run):
+    best_idx = 0
+    best_risk = -1.0
+    for idx, token in enumerate(run.get("tokens") or []):
+        risk = token.get("decoder_risk")
+        try:
+            risk = float(risk)
+        except (TypeError, ValueError):
+            continue
+        if risk > best_risk:
+            best_risk = risk
+            best_idx = idx
+    return best_idx
+
+
+def decode_candidate_until_claim(run, focus_token_index, max_new_tokens=None):
+    started = time.monotonic()
+    initialize_prefill_tokens(run)
+
+    meta = run["meta"]
+    settings = meta["generation_settings"]
+    prompt_hash = meta["prompt_hash"]
+    base_url = meta["base_url"]
+    inference_prompt = meta.get("inference_prompt") or meta.get("prompt", "")
+    model_name = meta.get("model")
+
+    vector_provider = VectorProvider(
+        settings.get("vector_mode", "placeholder"),
+        base_url,
+        settings.get("vector_dim", DEFAULTS["vector_dim"]),
+        settings.get("vector_window", DEFAULTS["vector_window"]),
+        prompt_hash,
+    )
+
+    history_text = [t.get("text") or "" for t in run["tokens"]]
+    if run["tokens"] and isinstance(run["tokens"][-1].get("embedding"), list):
+        vector_provider.prev = run["tokens"][-1]["embedding"]
+
+    token_index = len(run["tokens"])
+    generated_text = ""
+    remaining = max(0, settings.get("max_tokens", DEFAULTS["max_tokens"]) - token_index)
+    if max_new_tokens is not None:
+        remaining = min(remaining, max(0, int(max_new_tokens)))
+
+    while remaining > 0:
+        token, stop_info, model_name = generate_single_token_step(
+            base_url,
+            inference_prompt + generated_text,
+            settings,
+            model_name,
+            prompt_hash,
+            token_index,
+            history_text,
+            vector_provider,
+            started,
+        )
+        if model_name and meta.get("model") != model_name:
+            meta["model"] = model_name
+        if token is None:
+            break
+
+        token_text = token.get("text", "")
+        generated_text += token_text
+        history_text.append(token_text)
+        meta["providers"]["embedding"] = vector_provider.mode
+        add_token_local(run, token)
+        recompute_kinematics(run["tokens"])
+        enrich_decoder_diagnostics(run["tokens"])
+        run["analysis"]["regime_markers"] = detect_regime_markers(run["tokens"])
+        run["analysis"]["decoder_alerts"] = detect_decoder_alerts(run["tokens"])
+        token_index += 1
+        remaining -= 1
+
+        claim = claim_for_token_index(run, focus_token_index, require_complete=True)
+        if claim is not None and claim.get("token_end") is not None and claim["token_end"] >= focus_token_index:
+            break
+
+        if stop_info.get("hard_stop"):
+            break
+        if stop_info.get("stop") and remaining <= 0:
+            break
+
+    finalize_completed_run(run, started, status="complete")
+    return run
+
+
 def decode_run_local(run, max_new_tokens=None, progress_cb=None, phase=None):
     started = time.monotonic()
     initialize_prefill_tokens(run)
@@ -1781,6 +2415,13 @@ def sanitize_live_policy(raw_policy):
         "max_interventions": sanitize_int(raw_policy.get("max_interventions", 2), 2, minimum=0, maximum=8),
         "min_risk_drop": sanitize_float(raw_policy.get("min_risk_drop", 0.08), 0.08, minimum=0.0, maximum=1.0),
         "cooldown_tokens": sanitize_int(raw_policy.get("cooldown_tokens", 4), 4, minimum=0, maximum=24),
+        "candidate_harness_topk": sanitize_int(raw_policy.get("candidate_harness_topk", 2), 2, minimum=1, maximum=3),
+        "harness_min_drop": sanitize_float(raw_policy.get("harness_min_drop", 0.12), 0.12, minimum=0.0, maximum=1.0),
+        "harness_trigger_threshold": sanitize_float(raw_policy.get("harness_trigger_threshold", 0.52), 0.52, minimum=0.0, maximum=1.0),
+        "harness_max_facts": sanitize_int(raw_policy.get("harness_max_facts", 2), 2, minimum=1, maximum=4),
+        "harness_samples": sanitize_int(raw_policy.get("harness_samples", 2), 2, minimum=2, maximum=3),
+        "harness_probe_tokens": sanitize_int(raw_policy.get("harness_probe_tokens", 48), 48, minimum=8, maximum=160),
+        "harness_json_tokens": sanitize_int(raw_policy.get("harness_json_tokens", 220), 220, minimum=64, maximum=400),
     }
 
 
@@ -1831,15 +2472,17 @@ def run_candidate_branch(parent_run, rollback_index, alt_rank, lookahead):
     inference_prompt = prompt + "".join(tok.get("text", "") for tok in prefill_tokens)
 
     settings = copy.deepcopy(parent_run.get("meta", {}).get("generation_settings") or {})
+    settings = sanitize_settings(settings)
+    settings["id_slot"] = probe_slot_for_settings(settings, 2 + alt_rank)
     run = create_run_object(
         prompt=prompt,
         base_url=parent_run.get("meta", {}).get("base_url", DEFAULTS["base_url"]),
-        settings=sanitize_settings(settings),
+        settings=settings,
         label=f"Candidate@{rollback_index}:{alt_rank}",
         prefill_tokens=prefill_tokens,
         inference_prompt=inference_prompt,
     )
-    decode_run_local(run, max_new_tokens=lookahead)
+    decode_candidate_until_claim(run, rollback_index, max_new_tokens=lookahead)
 
     candidate_window = run.get("tokens", [])[rollback_index:]
     risks = [float(t.get("decoder_risk") or 0.0) for t in candidate_window] if candidate_window else []
@@ -1905,6 +2548,7 @@ def run_live_correction_experiment(prompt, base_url, settings, policy, experimen
     remaining = max(0, cfg.get("max_tokens", DEFAULTS["max_tokens"]) - token_index)
     interventions = []
     last_intervention_index = -999
+    last_harness_claim_key = None
 
     while remaining > 0:
         token, stop_info, model_name = generate_single_token_step(
@@ -1955,91 +2599,176 @@ def run_live_correction_experiment(prompt, base_url, settings, policy, experimen
             rollback_index, current_avg_risk = rollback_index_for_run(corrected, policy)
             if rollback_index is not None:
                 trigger_index = len(corrected["tokens"]) - 1
-                target = corrected["tokens"][rollback_index]
-                topn = target.get("topN") or []
-                candidate_results = []
-                limit = min(len(topn), policy["branch_candidates"] + 1)
-                for alt_rank in range(1, limit):
-                    alt_text = str((topn[alt_rank] or {}).get("token_text") or "")
-                    if not alt_text.strip() or not any(ch.isalnum() for ch in alt_text):
-                        continue
-                    result = run_candidate_branch(corrected, rollback_index, alt_rank, policy["branch_lookahead"])
-                    if result is not None:
-                        candidate_results.append(result)
+                focus_claim = claim_for_token_index(corrected, rollback_index, require_complete=True)
+                claim_key = None
+                if focus_claim is not None:
+                    claim_key = (focus_claim.get("start"), focus_claim.get("end"))
+                if claim_key is None or claim_key == last_harness_claim_key:
+                    if stop_info.get("hard_stop"):
+                        break
+                    if stop_info.get("stop") and remaining <= 0:
+                        break
+                    continue
 
-                candidate_results = [c for c in candidate_results if c.get("avg_risk") is not None]
-                candidate_results.sort(key=lambda item: (item.get("avg_risk"), item.get("max_risk") or 0.0))
+                current_harness = run_claim_harness(corrected, rollback_index, policy)
+                last_harness_claim_key = claim_key
+                progress(
+                    "live_experiment_harness",
+                    {
+                        "phase": "corrected",
+                        "run_id": corrected["run_id"],
+                        "rollback_index": rollback_index,
+                        "trigger_index": trigger_index,
+                        "status": current_harness.get("status"),
+                        "label": current_harness.get("label"),
+                        "claim_risk": current_harness.get("claim_risk"),
+                        "claim_text": (current_harness.get("standalone_claim") or ((current_harness.get("claim") or {}).get("text")) or ""),
+                    },
+                )
 
-                best = candidate_results[0] if candidate_results else None
-                if best is not None and current_avg_risk is not None and best["avg_risk"] <= (current_avg_risk - policy["min_risk_drop"]):
-                    corrected["tokens"] = best["run"]["tokens"]
-                    corrected["meta"]["providers"]["embedding"] = best["run"]["meta"]["providers"].get("embedding", corrected["meta"]["providers"].get("embedding"))
-                    recompute_kinematics(corrected["tokens"])
-                    enrich_decoder_diagnostics(corrected["tokens"])
-                    corrected["analysis"]["regime_markers"] = detect_regime_markers(corrected["tokens"])
-                    corrected["analysis"]["decoder_alerts"] = detect_decoder_alerts(corrected["tokens"])
+                if (
+                    current_harness.get("status") == "ok"
+                    and current_harness.get("claim_risk") is not None
+                    and current_harness["claim_risk"] >= policy["harness_trigger_threshold"]
+                ):
+                    target = corrected["tokens"][rollback_index]
+                    topn = target.get("topN") or []
+                    candidate_results = []
+                    limit = min(len(topn), policy["branch_candidates"] + 1)
+                    for alt_rank in range(1, limit):
+                        alt_text = str((topn[alt_rank] or {}).get("token_text") or "")
+                        if not alt_text.strip() or not any(ch.isalnum() for ch in alt_text):
+                            continue
+                        result = run_candidate_branch(corrected, rollback_index, alt_rank, policy["branch_lookahead"])
+                        if result is not None:
+                            candidate_results.append(result)
 
-                    history_text = [t.get("text") or "" for t in corrected["tokens"]]
-                    token_index = len(corrected["tokens"])
-                    generated_text = "".join(history_text)
-                    remaining = max(0, cfg.get("max_tokens", DEFAULTS["max_tokens"]) - token_index)
-                    vector_provider = VectorProvider(
-                        corrected["meta"]["providers"].get("embedding", cfg.get("vector_mode", "placeholder")),
-                        base_url,
-                        cfg.get("vector_dim", DEFAULTS["vector_dim"]),
-                        cfg.get("vector_window", DEFAULTS["vector_window"]),
-                        prompt_hash,
+                    candidate_results = [c for c in candidate_results if c.get("avg_risk") is not None]
+                    candidate_results.sort(key=lambda item: (item.get("avg_risk"), item.get("max_risk") or 0.0))
+
+                    for item in candidate_results[: policy["candidate_harness_topk"]]:
+                        item["harness"] = run_claim_harness(item["run"], rollback_index, policy)
+
+                    ranked_candidates = []
+                    for item in candidate_results:
+                        harness = item.get("harness")
+                        harness_risk = None
+                        if isinstance(harness, dict):
+                            harness_risk = harness.get("claim_risk")
+                        ranked_candidates.append(
+                            {
+                                **item,
+                                "harness_risk": harness_risk,
+                            }
+                        )
+
+                    valid_candidates = [item for item in ranked_candidates if item.get("harness_risk") is not None]
+                    valid_candidates.sort(key=lambda item: (item.get("harness_risk"), item.get("avg_risk"), item.get("max_risk") or 0.0))
+                    best = valid_candidates[0] if valid_candidates else None
+
+                    baseline_claim_risk = float(current_harness["claim_risk"])
+                    harness_improved = (
+                        best is not None
+                        and best.get("harness_risk") is not None
+                        and best["harness_risk"] <= (baseline_claim_risk - policy["harness_min_drop"])
                     )
-                    if corrected["tokens"] and isinstance(corrected["tokens"][-1].get("embedding"), list):
-                        vector_provider.prev = corrected["tokens"][-1]["embedding"]
+                    risk_improved = (
+                        best is not None
+                        and current_avg_risk is not None
+                        and best.get("avg_risk") is not None
+                        and best["avg_risk"] <= (current_avg_risk - max(0.02, policy["min_risk_drop"] * 0.5))
+                    )
 
-                    interventions.append(
-                        {
-                            "mode": "prefix_replay",
-                            "trigger_index": trigger_index,
-                            "rollback_index": rollback_index,
-                            "baseline_avg_risk": current_avg_risk,
-                            "chosen_alt_rank": best["alt_rank"],
-                            "chosen_alt_text": best["alt_token_text"],
-                            "chosen_avg_risk": best["avg_risk"],
-                            "chosen_max_risk": best["max_risk"],
-                            "candidates": [
-                                {
-                                    "alt_rank": item["alt_rank"],
-                                    "alt_token_text": item["alt_token_text"],
-                                    "avg_risk": item["avg_risk"],
-                                    "max_risk": item["max_risk"],
-                                    "accepted": item["alt_rank"] == best["alt_rank"],
-                                }
-                                for item in candidate_results
-                            ],
-                        }
-                    )
-                    progress(
-                        "live_experiment_intervention",
-                        {
-                            "rollback_index": rollback_index,
-                            "trigger_index": trigger_index,
-                            "baseline_avg_risk": current_avg_risk,
-                            "chosen_alt_rank": best["alt_rank"],
-                            "chosen_alt_text": best["alt_token_text"],
-                            "chosen_avg_risk": best["avg_risk"],
-                            "chosen_max_risk": best["max_risk"],
-                            "candidates": [
-                                {
-                                    "alt_rank": item["alt_rank"],
-                                    "alt_token_text": item["alt_token_text"],
-                                    "avg_risk": item["avg_risk"],
-                                    "max_risk": item["max_risk"],
-                                    "accepted": item["alt_rank"] == best["alt_rank"],
-                                }
-                                for item in candidate_results
-                            ],
-                            "corrected_text": joined_run_text(corrected),
-                            "corrected_run_id": corrected["run_id"],
-                        },
-                    )
-                    last_intervention_index = len(corrected["tokens"]) - 1
+                    if best is not None and harness_improved and risk_improved:
+                        chosen_harness = best.get("harness") or {}
+                        corrected["tokens"] = best["run"]["tokens"]
+                        corrected["meta"]["providers"]["embedding"] = best["run"]["meta"]["providers"].get("embedding", corrected["meta"]["providers"].get("embedding"))
+                        recompute_kinematics(corrected["tokens"])
+                        enrich_decoder_diagnostics(corrected["tokens"])
+                        corrected["analysis"]["regime_markers"] = detect_regime_markers(corrected["tokens"])
+                        corrected["analysis"]["decoder_alerts"] = detect_decoder_alerts(corrected["tokens"])
+
+                        history_text = [t.get("text") or "" for t in corrected["tokens"]]
+                        token_index = len(corrected["tokens"])
+                        generated_text = "".join(history_text)
+                        remaining = max(0, cfg.get("max_tokens", DEFAULTS["max_tokens"]) - token_index)
+                        vector_provider = VectorProvider(
+                            corrected["meta"]["providers"].get("embedding", cfg.get("vector_mode", "placeholder")),
+                            base_url,
+                            cfg.get("vector_dim", DEFAULTS["vector_dim"]),
+                            cfg.get("vector_window", DEFAULTS["vector_window"]),
+                            prompt_hash,
+                        )
+                        if corrected["tokens"] and isinstance(corrected["tokens"][-1].get("embedding"), list):
+                            vector_provider.prev = corrected["tokens"][-1]["embedding"]
+
+                        interventions.append(
+                            {
+                                "mode": "prefix_replay",
+                                "trigger_index": trigger_index,
+                                "rollback_index": rollback_index,
+                                "baseline_avg_risk": current_avg_risk,
+                                "baseline_claim_risk": current_harness.get("claim_risk"),
+                                "baseline_claim_label": current_harness.get("label"),
+                                "baseline_claim": current_harness.get("standalone_claim") or ((current_harness.get("claim") or {}).get("text")),
+                                "chosen_alt_rank": best["alt_rank"],
+                                "chosen_alt_text": best["alt_token_text"],
+                                "chosen_avg_risk": best["avg_risk"],
+                                "chosen_max_risk": best["max_risk"],
+                                "chosen_claim_risk": chosen_harness.get("claim_risk"),
+                                "chosen_claim_label": chosen_harness.get("label"),
+                                "chosen_claim": chosen_harness.get("standalone_claim") or ((chosen_harness.get("claim") or {}).get("text")),
+                                "baseline_harness": copy.deepcopy(current_harness),
+                                "chosen_harness": copy.deepcopy(chosen_harness),
+                                "candidates": [
+                                    {
+                                        "alt_rank": item["alt_rank"],
+                                        "alt_token_text": item["alt_token_text"],
+                                        "avg_risk": item["avg_risk"],
+                                        "max_risk": item["max_risk"],
+                                        "claim_risk": item.get("harness_risk"),
+                                        "claim_label": (item.get("harness") or {}).get("label"),
+                                        "accepted": item["alt_rank"] == best["alt_rank"],
+                                    }
+                                    for item in ranked_candidates
+                                ],
+                            }
+                        )
+                        progress(
+                            "live_experiment_intervention",
+                            {
+                                "rollback_index": rollback_index,
+                                "trigger_index": trigger_index,
+                                "baseline_avg_risk": current_avg_risk,
+                                "chosen_alt_rank": best["alt_rank"],
+                                "chosen_alt_text": best["alt_token_text"],
+                                "chosen_avg_risk": best["avg_risk"],
+                                "chosen_max_risk": best["max_risk"],
+                                "baseline_claim_risk": current_harness.get("claim_risk"),
+                                "baseline_claim_label": current_harness.get("label"),
+                                "baseline_claim": current_harness.get("standalone_claim") or ((current_harness.get("claim") or {}).get("text")),
+                                "chosen_claim_risk": chosen_harness.get("claim_risk"),
+                                "chosen_claim_label": chosen_harness.get("label"),
+                                "chosen_claim": chosen_harness.get("standalone_claim") or ((chosen_harness.get("claim") or {}).get("text")),
+                                "candidates": [
+                                    {
+                                        "alt_rank": item["alt_rank"],
+                                        "alt_token_text": item["alt_token_text"],
+                                        "avg_risk": item["avg_risk"],
+                                        "max_risk": item["max_risk"],
+                                        "claim_risk": item.get("harness_risk"),
+                                        "claim_label": (item.get("harness") or {}).get("label"),
+                                        "accepted": item["alt_rank"] == best["alt_rank"],
+                                    }
+                                    for item in ranked_candidates
+                                ],
+                                "corrected_text": joined_run_text(corrected),
+                                "corrected_run_id": corrected["run_id"],
+                                "baseline_harness": copy.deepcopy(current_harness),
+                                "chosen_harness": copy.deepcopy(chosen_harness),
+                            },
+                        )
+                        last_intervention_index = len(corrected["tokens"]) - 1
 
         if stop_info.get("hard_stop"):
             break
@@ -2053,6 +2782,10 @@ def run_live_correction_experiment(prompt, base_url, settings, policy, experimen
     if not interventions:
         corrected["meta"]["label"] = "Replay"
     corrected.setdefault("analysis", {})["interventions"] = copy.deepcopy(interventions)
+    baseline_harness = run_claim_harness(baseline, peak_risk_token_index(baseline), policy)
+    corrected_harness = run_claim_harness(corrected, peak_risk_token_index(corrected), policy)
+    baseline.setdefault("analysis", {})["focus_claim"] = copy.deepcopy(baseline_harness)
+    corrected.setdefault("analysis", {})["focus_claim"] = copy.deepcopy(corrected_harness)
 
     with RUNS_LOCK:
         RUNS[baseline["run_id"]] = copy.deepcopy(baseline)
@@ -2069,12 +2802,18 @@ def run_live_correction_experiment(prompt, base_url, settings, policy, experimen
         "baseline": baseline,
         "corrected": corrected,
         "interventions": interventions,
+        "harness": {
+            "baseline": baseline_harness,
+            "corrected": corrected_harness,
+        },
         "policy": policy,
         "metrics": {
             "baseline_max_risk": baseline.get("summary", {}).get("decoder_risk_max"),
             "corrected_max_risk": corrected.get("summary", {}).get("decoder_risk_max"),
             "baseline_alerts": baseline.get("summary", {}).get("decoder_alert_count"),
             "corrected_alerts": corrected.get("summary", {}).get("decoder_alert_count"),
+            "baseline_claim_risk": baseline_harness.get("claim_risk") if isinstance(baseline_harness, dict) else None,
+            "corrected_claim_risk": corrected_harness.get("claim_risk") if isinstance(corrected_harness, dict) else None,
             "intervention_count": len(interventions),
         },
     }

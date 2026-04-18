@@ -483,6 +483,19 @@ kbd {
   gap: 10px;
 }
 
+.harness-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.harness-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
 .text-block {
   border: 1px solid #d9e5f1;
   border-radius: 10px;
@@ -797,6 +810,11 @@ kbd {
 
 @media (max-width: 1200px) {
   #workspace {
+    grid-template-columns: 1fr;
+  }
+
+  .result-grid,
+  .harness-grid {
     grid-template-columns: 1fr;
   }
 

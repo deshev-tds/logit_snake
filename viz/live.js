@@ -45,6 +45,16 @@ const ui = {
 
   interventionCount: document.getElementById('intervention-count'),
   interventionList: document.getElementById('intervention-list'),
+
+  harnessSummary: document.getElementById('harness-summary'),
+  baselineClaimRisk: document.getElementById('baseline-claim-risk'),
+  baselineClaimLabel: document.getElementById('baseline-claim-label'),
+  baselineClaimText: document.getElementById('baseline-claim-text'),
+  baselineClaimEvidence: document.getElementById('baseline-claim-evidence'),
+  correctedClaimRisk: document.getElementById('corrected-claim-risk'),
+  correctedClaimLabel: document.getElementById('corrected-claim-label'),
+  correctedClaimText: document.getElementById('corrected-claim-text'),
+  correctedClaimEvidence: document.getElementById('corrected-claim-evidence'),
 };
 
 const state = {
@@ -353,7 +363,10 @@ function renderInterventions(result) {
 
     const summary = document.createElement('div');
     summary.className = 'mutation-parent';
-    summary.textContent = `baseline avg risk ${formatPercent(item.baseline_avg_risk, 0)} -> chosen ${formatPercent(item.chosen_avg_risk, 0)} via alt ${item.chosen_alt_rank + 1} (${displayTokenText(item.chosen_alt_text)})`;
+    summary.textContent =
+      `decoder avg ${formatPercent(item.baseline_avg_risk, 0)} -> ${formatPercent(item.chosen_avg_risk, 0)} | `
+      + `claim ${formatPercent(item.baseline_claim_risk, 0)} -> ${formatPercent(item.chosen_claim_risk, 0)} `
+      + `via alt ${item.chosen_alt_rank + 1} (${displayTokenText(item.chosen_alt_text)})`;
     block.appendChild(summary);
 
     const candidates = document.createElement('div');
@@ -361,13 +374,68 @@ function renderInterventions(result) {
     candidates.textContent = (item.candidates || [])
       .map((candidate) => {
         const accepted = candidate.accepted ? 'accepted' : 'candidate';
-        return `#${candidate.alt_rank + 1} ${accepted} | ${displayTokenText(candidate.alt_token_text)} | avg risk ${formatPercent(candidate.avg_risk, 0)} | max ${formatPercent(candidate.max_risk, 0)}`;
+        return `#${candidate.alt_rank + 1} ${accepted} | ${displayTokenText(candidate.alt_token_text)} | avg risk ${formatPercent(candidate.avg_risk, 0)} | claim ${formatPercent(candidate.claim_risk, 0)} | ${candidate.claim_label || 'no harness'}`;
       })
       .join('\n');
     block.appendChild(candidates);
 
     ui.interventionList.appendChild(block);
   });
+}
+
+function harnessClaimText(harness) {
+  if (!harness || typeof harness !== 'object') return '-';
+  return harness?.standalone_claim || harness?.claim?.text || '-';
+}
+
+function formatHarnessEvidence(harness) {
+  if (!harness || typeof harness !== 'object') return '-';
+  if (harness.status && harness.status !== 'ok') {
+    return `Status: ${harness.status.replace(/_/g, ' ')}`;
+  }
+  const facts = Array.isArray(harness?.facts) ? harness.facts : [];
+  if (!facts.length) return 'No targeted probes were captured for this claim.';
+  return facts.map((item, idx) => {
+    const answers = Array.isArray(item?.answers) ? item.answers : [];
+    const judge = item?.judgement || {};
+    return [
+      `Fact ${idx + 1}: ${item?.fact || '-'}`,
+      `Question: ${item?.question || '-'}`,
+      `Answer 1: ${answers[0]?.text || '-'}`,
+      `Answer 2: ${answers[1]?.text || '-'}`,
+      `Judge: ${(judge?.verdict || '-').replace(/_/g, ' ')} | agreement ${(judge?.agreement || '-').replace(/_/g, ' ')} | risk ${formatPercent(judge?.fact_risk, 0)}`,
+      judge?.reason ? `Reason: ${judge.reason}` : '',
+    ].filter(Boolean).join('\n');
+  }).join('\n\n');
+}
+
+function renderHarness(result) {
+  const baselineHarness = result?.harness?.baseline || null;
+  const correctedHarness = result?.harness?.corrected || null;
+  const comparedLabel = Number(result?.metrics?.intervention_count ?? 0) > 0 ? 'Corrected' : 'Replay';
+
+  ui.baselineClaimRisk.textContent = formatPercent(baselineHarness?.claim_risk, 0);
+  ui.baselineClaimLabel.textContent = baselineHarness?.label ? baselineHarness.label.replace(/-/g, ' ') : (baselineHarness?.status || '-').replace(/_/g, ' ');
+  ui.baselineClaimText.textContent = harnessClaimText(baselineHarness);
+  ui.baselineClaimEvidence.textContent = formatHarnessEvidence(baselineHarness);
+
+  ui.correctedClaimRisk.textContent = formatPercent(correctedHarness?.claim_risk, 0);
+  ui.correctedClaimLabel.textContent = correctedHarness?.label ? correctedHarness.label.replace(/-/g, ' ') : (correctedHarness?.status || '-').replace(/_/g, ' ');
+  ui.correctedClaimText.textContent = harnessClaimText(correctedHarness);
+  ui.correctedClaimEvidence.textContent = formatHarnessEvidence(correctedHarness);
+
+  if (baselineHarness?.claim_risk != null && correctedHarness?.claim_risk != null) {
+    ui.harnessSummary.textContent =
+      `Baseline focus-claim risk ${formatPercent(baselineHarness.claim_risk, 0)} vs ${comparedLabel.toLowerCase()} ${formatPercent(correctedHarness.claim_risk, 0)}. `
+      + `These scores come from targeted factual probes, not from decoder telemetry alone.`;
+    return;
+  }
+
+  if (correctedHarness?.status) {
+    ui.harnessSummary.textContent = `Harness status: ${(correctedHarness.status || '-').replace(/_/g, ' ')}.`;
+    return;
+  }
+  ui.harnessSummary.textContent = 'No claim-level harness evidence was collected for this run.';
 }
 
 function resetExperimentView() {
@@ -390,6 +458,15 @@ function resetExperimentView() {
   ui.correctedText.textContent = '-';
   ui.interventionCount.textContent = '0';
   ui.interventionList.innerHTML = '<div class=\"empty-list\">No intervention has been triggered yet.</div>';
+  ui.harnessSummary.textContent = 'Waiting for a completed check-worthy claim before the harness can evaluate anything.';
+  ui.baselineClaimRisk.textContent = '-';
+  ui.baselineClaimLabel.textContent = '-';
+  ui.baselineClaimText.textContent = '-';
+  ui.baselineClaimEvidence.textContent = '-';
+  ui.correctedClaimRisk.textContent = '-';
+  ui.correctedClaimLabel.textContent = '-';
+  ui.correctedClaimText.textContent = '-';
+  ui.correctedClaimEvidence.textContent = '-';
 }
 
 function renderPartialInterventions() {
@@ -446,11 +523,25 @@ function connectStream() {
       return;
     }
 
+    if (payload.type === 'live_experiment_harness') {
+      const claim = payload.claim_text || 'pending claim extraction';
+      const label = payload.label ? payload.label.replace(/-/g, ' ') : (payload.status || 'pending').replace(/_/g, ' ');
+      ui.harnessSummary.textContent =
+        `Harness checked claim near token ${payload.rollback_index ?? '-'}: ${label}`
+        + (payload.claim_risk != null ? ` (${formatPercent(payload.claim_risk, 0)})` : '')
+        + `. ${claim}`;
+      setStatus(`Evaluating risky claim near token ${payload.rollback_index}`, 'neutral');
+      return;
+    }
+
     if (payload.type === 'live_experiment_intervention') {
       state.partialInterventions.push(payload);
       renderPartialInterventions();
       if (payload.corrected_text) {
         ui.correctedText.textContent = payload.corrected_text;
+      }
+      if (payload.baseline_harness || payload.chosen_harness) {
+        renderHarness({ harness: { baseline: payload.baseline_harness, corrected: payload.chosen_harness }, metrics: { intervention_count: 1 } });
       }
       setStatus(`Intervention at token ${payload.trigger_index}`, 'neutral');
       return;
@@ -481,11 +572,13 @@ function renderResult(result) {
   if (interventionCount > 0) {
     ui.experimentSummary.textContent =
       `Baseline max risk ${formatPercent(result?.metrics?.baseline_max_risk, 0)} vs corrected ${formatPercent(result?.metrics?.corrected_max_risk, 0)}. `
+      + `Claim risk: ${formatPercent(result?.metrics?.baseline_claim_risk, 0)} -> ${formatPercent(result?.metrics?.corrected_claim_risk, 0)}. `
       + `Alerts: ${result?.metrics?.baseline_alerts ?? '-'} -> ${result?.metrics?.corrected_alerts ?? '-'}. `
       + `Use "Open In Snake Scope" to inspect both trajectories in the main visualizer.`;
   } else {
     ui.experimentSummary.textContent =
       `No intervention fired. Baseline max risk ${formatPercent(result?.metrics?.baseline_max_risk, 0)} and replay max risk ${formatPercent(result?.metrics?.corrected_max_risk, 0)} are two matched decode samples, not evidence that a correction policy helped or hurt. `
+      + `Claim risk is ${formatPercent(result?.metrics?.baseline_claim_risk, 0)} vs ${formatPercent(result?.metrics?.corrected_claim_risk, 0)}. `
       + `Use "Open In Snake Scope" to inspect both trajectories in the main visualizer.`;
   }
 
@@ -514,6 +607,7 @@ function renderResult(result) {
   ui.openMainLink.href = link.toString();
 
   renderInterventions(result);
+  renderHarness(result);
 }
 
 async function probeBackend() {

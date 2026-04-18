@@ -1,0 +1,32 @@
+# Data
+data/cache/
+data/original_dataset/
+data/database/*
+!data/database/preprocess_index.py
+!data/database/README.md
+
+# API
+utils/apis
+
+# jupyter codes
+.ipynb_checkpoints
+*.pdf
+*.txt
+*.sh
+
+# System
+*.pyc
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+
+# saves and cache
+saves/
+cache/
+script.sh
+.stfolder
+.stignore
+
+*.ipynb

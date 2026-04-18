@@ -133,6 +133,31 @@
         </section>
 
         <section class="subpanel">
+          <h3>Harness Evidence</h3>
+          <div id="harness-summary" class="info-note">No claim-level harness evidence yet.</div>
+
+          <div class="harness-grid">
+            <div class="harness-card">
+              <div class="kv"><span>Baseline Claim Risk</span><strong id="baseline-claim-risk">-</strong></div>
+              <div class="kv"><span>Baseline Verdict</span><strong id="baseline-claim-label">-</strong></div>
+              <div class="token-note">Focus claim</div>
+              <div id="baseline-claim-text" class="text-block">-</div>
+              <div class="token-note">Probe evidence</div>
+              <div id="baseline-claim-evidence" class="text-block">-</div>
+            </div>
+
+            <div class="harness-card">
+              <div class="kv"><span>Compared Claim Risk</span><strong id="corrected-claim-risk">-</strong></div>
+              <div class="kv"><span>Compared Verdict</span><strong id="corrected-claim-label">-</strong></div>
+              <div class="token-note">Focus claim</div>
+              <div id="corrected-claim-text" class="text-block">-</div>
+              <div class="token-note">Probe evidence</div>
+              <div id="corrected-claim-evidence" class="text-block">-</div>
+            </div>
+          </div>
+        </section>
+
+        <section class="subpanel">
           <h3>Limitations</h3>
           <div class="info-note">
             Lower decoder risk after branching is evidence of a gentler continuation, not proof of factual correctness.

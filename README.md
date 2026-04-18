@@ -53,6 +53,7 @@ http://127.0.0.1:8765
 - Reframed the time-series panels around decoder diagnostics: uncertainty, choice gap, uncertainty jump, repetition pressure, decoder risk, and geometry motion.
 - Added plain-language summary panels and backend/provenance checks.
 - Added an experimental `Live Branch Lab` subpage for baseline-vs-corrected decoder-risk intervention runs.
+- Added a claim-level harness path in `Live Branch Lab`: check-worthy claim extraction, targeted factual probes, consistency-based claim risk, and branch acceptance that requires more than raw decoder-risk improvement.
 
 ## Implemented on 2026-04-18
 
@@ -69,11 +70,17 @@ The current repo now includes the decoder-diagnostics rewrite described above.
 - Clarified the no-intervention case in `Live Branch Lab`: when no branch is accepted, the second run is labeled as a replay sample rather than being presented as a successful correction.
 - Updated handoff into `Snake Scope` so it opens on the max-risk token and distinguishes `Current Token Risk` from `Run Max Risk`.
 - Replaced the Lab's plain text output blocks with readable inline token rendering, peak-risk token highlighting, and per-token hover telemetry.
+- Added a first claim-level harness in `Live Branch Lab`: claim-boundary selection, check-worthy filtering, targeted factual probes, consistency scoring, and a second acceptance gate that requires claim-risk improvement as well as decoder-risk improvement.
+- Added a local research corpus under [docs/research](docs/research) with downloaded papers, raw notes, and vendored code snapshots from the papers we borrowed methodology from.
 - Pruned [docs/NEXT_STEPS.md](docs/NEXT_STEPS.md) so it contains only active lab work and no non-research backlog filler.
 - Measured the current latency envelope on a fixed `max_tokens=18` / single-intervention benchmark:
   - backend mean completion time: about `4.08s` before SSE vs `4.12s` after SSE
   - first visible UI update: about `4.07s` before SSE vs `0.08s` after SSE
   - first visible token text: about `0.23s` after SSE
+- Measured the first black-box harness pass on the fake-monograph workload:
+  - initial claim-harness loop: about `354s` on `max_tokens=96`
+  - after claim-level dedupe: about `155s` on `max_tokens=64`
+  - implication: the claim harness is useful evidence, but still too expensive to treat as a free always-on pass
 
 ## Visual Evidence
 
@@ -97,15 +104,28 @@ What it does:
 - runs a baseline decode and a corrected decode with the same prompt/settings
 - watches decoder-risk token-by-token
 - when the risk stays high long enough, it replays from an earlier prefix and evaluates a few alternative next-token branches
-- chooses a lower-risk branch only if the measured reduction is large enough
+- isolates a check-worthy claim near the risky region, asks targeted factual probes about it, and scores consistency across the answers
+- chooses a lower-risk branch only if the measured reduction is large enough and the claim-level harness score also improves
 - renders the generated text as inline tokens, highlights the peak-risk token, and exposes token telemetry on hover
+- renders claim-level evidence cards so the current risky claim, label, and probe findings are visible next to the decode result
 
 Current limitation:
 - this is a `prefix_replay` intervention, not exact KV-state rollback
 - lower decoder risk after branching is useful evidence, but it is not proof of factual correctness
+- the current claim harness is still black-box and slow; on a realistic fake-reference workload it adds minutes, not milliseconds
 - if no intervention fires, the second run should be read as a matched replay sample rather than as evidence of successful correction
 
 The repeatable evaluation plan for this page lives in [docs/LIVE_BRANCH_EVAL.md](docs/LIVE_BRANCH_EVAL.md).
+
+## Research Corpus
+
+The local research artifacts behind the current project pivot live in [docs/research](docs/research).
+
+That directory now contains:
+- a survey memo with method-by-method borrowing notes: [docs/research/2026-04-18-harness-survey.md](docs/research/2026-04-18-harness-survey.md)
+- downloaded PDF copies of the papers we relied on: [docs/research/papers](docs/research/papers)
+- vendored snapshots of public code released with relevant papers: [docs/research/code](docs/research/code)
+- raw extraction notes used while comparing the papers against this codebase: [docs/research/notes/paper_extracts.txt](docs/research/notes/paper_extracts.txt)
 
 ## Research Recalibration (2026-04-17)
 
@@ -127,15 +147,29 @@ Operational consequence for this tool:
 - `regime_markers` are investigation cues, not factuality labels
 - `velocity` and `curvature` are especially easy to over-interpret when the run uses placeholder vectors instead of real embeddings
 
-Evidence base behind this correction:
+Second correction made on `2026-04-18`:
+- when risk crosses a threshold, do not ask a single generic question like "are you sure?"
+- use telemetry as a trigger, then stop at a check-worthy claim boundary
+- ask targeted factual probes about the risky claim and score internal consistency
+- only accept a rewritten branch when the claim-level evidence improves, not only when decoder-risk falls
+
+Evidence base behind this correction and the later harness pivot:
+- Agrawal et al., EACL Findings 2024, "Do Language Models Know When They're Hallucinating References?":
+  https://aclanthology.org/2024.findings-eacl.62/
 - Kuhn et al., Nature 2024, "Detecting hallucinations in large language models using semantic entropy":
   https://www.nature.com/articles/s41586-024-07421-0
+- Liang et al., KnowledgeNLP 2024, "Learning to Trust Your Feelings":
+  https://aclanthology.org/2024.knowledgenlp-1.4/
 - Li et al., NAACL Findings 2025, "HALLUCANA: Fixing LLM Hallucination with A Canary Lookahead":
   https://aclanthology.org/2025.findings-naacl.12/
 - Wu et al., NAACL Findings 2025, "Improve Decoding Factuality by Token-wise Cross Layer Entropy of Large Language Models":
   https://aclanthology.org/2025.findings-naacl.217/
+- Liu et al., ACL Findings 2025, "Long-form Hallucination Detection with Self-elicitation":
+  https://aclanthology.org/2025.findings-acl.211/
 - Qin et al., ACL 2025, "Learning Auxiliary Tasks Improves Reference-Free Hallucination Detection in Open-Domain Long-Form Generation":
   https://aclanthology.org/2025.acl-short.93/
+- Gupta et al., IJCNLP Findings 2025, "Consistency Is the Key":
+  https://aclanthology.org/2025.findings-ijcnlp.129/
 - Han et al., EMNLP Findings 2025, "Simple Factuality Probes Detect Hallucinations in Long-Form Natural Language Generation":
   https://aclanthology.org/2025.findings-emnlp.880/
 - Kim et al., EMNLP 2025, "Detecting LLM Hallucination Through Layer-wise Information Deficiency":
@@ -144,6 +178,8 @@ Evidence base behind this correction:
   https://aclanthology.org/2025.findings-emnlp.952/
 - Kulkarni et al., EMNLP Findings 2025, "Evaluating Evaluation Metrics - The Mirage of Hallucination Detection":
   https://aclanthology.org/2025.findings-emnlp.1035/
+- Azaria and Mitchell 2023, "The Internal State of an LLM Knows When It's Lying":
+  https://arxiv.org/abs/2304.13734
 
 ## Roadmap Toward Better Hallucination-Onset Detection
 
@@ -172,8 +208,8 @@ Planned expansion path:
 
 ### Phase 1: Add Black-Box Factuality Probes
 
+- harden the current claim/span harness with better boundary detection, de-contextualization, and key-fact extraction
 - branch the same prefix into multiple stochastic continuations and compute semantic uncertainty around the next claim/span
-- segment output into candidate claims and attach risk at the claim level rather than only the token level
 - add retrieval-backed evidence checks for extracted claims
 - render "supported / unsupported / unknown" overlays next to the current telemetry plots
 
@@ -377,7 +413,7 @@ These are still decoder-side heuristics, not claim-level factuality checks.
 - Optional strict token-forcing via backend-native logit bias when reliably supported.
 - More robust DTW-style alignment for very different-length outputs.
 - Explicit run persistence on disk (currently in-memory unless exported/imported).
-- Claim/span extraction and evidence-grounded factuality checks.
-- Multi-sample semantic uncertainty rather than single-pass entropy only.
+- Stronger claim/span extraction, de-contextualization, and probe templating.
+- Multi-sample semantic uncertainty as a secondary checker rather than single-pass entropy only.
 - White-box telemetry capture for cross-layer / hidden-state analysis when the backend allows it.
 - Detector calibration and OOD evaluation against human-aligned factuality labels.
