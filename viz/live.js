@@ -48,6 +48,14 @@ const ui = {
   interventionCount: document.getElementById('intervention-count'),
   interventionList: document.getElementById('intervention-list'),
 
+  modeCurrent: document.getElementById('mode-current'),
+  modeFocusObject: document.getElementById('mode-focus-object'),
+  baselineObjectRisk: document.getElementById('baseline-object-risk'),
+  baselineObjectLabel: document.getElementById('baseline-object-label'),
+  correctedObjectRisk: document.getElementById('corrected-object-risk'),
+  correctedObjectLabel: document.getElementById('corrected-object-label'),
+  objectEvidence: document.getElementById('object-evidence'),
+
   harnessSummary: document.getElementById('harness-summary'),
   baselineClaimRisk: document.getElementById('baseline-claim-risk'),
   baselineClaimLabel: document.getElementById('baseline-claim-label'),
@@ -440,7 +448,7 @@ function renderBackend() {
   ui.backendModelRequired.textContent = info ? capabilityText(info.model_required_explicit) : '-';
   ui.backendStopSemantics.textContent = info ? capabilityText(info.stop_semantics) : '-';
   ui.backendTokenForcing.textContent = info ? capabilityText(info.strict_token_forcing) : '-';
-  ui.backendMode.textContent = 'prefix_replay';
+  ui.backendMode.textContent = 'hybrid replay / rewrite';
 }
 
 function applyBackendInfo(info, { updateStatus = true } = {}) {
@@ -490,6 +498,7 @@ function renderInterventions(result) {
     summary.textContent =
       `decoder avg ${formatPercent(item.baseline_avg_risk, 0)} -> ${formatPercent(item.chosen_avg_risk, 0)} | `
       + `claim ${formatPercent(item.baseline_claim_risk, 0)} -> ${formatPercent(item.chosen_claim_risk, 0)} `
+      + `| object ${formatPercent(item.baseline_object_risk, 0)} -> ${formatPercent(item.chosen_object_risk, 0)} `
       + `via ${String(item.chosen_strategy || 'candidate').replace(/_/g, ' ')} `
       + `${item.chosen_alt_rank >= 0 ? `alt ${item.chosen_alt_rank + 1}` : ''} (${displayTokenText(item.chosen_alt_text)})`;
     block.appendChild(summary);
@@ -500,13 +509,65 @@ function renderInterventions(result) {
       .map((candidate) => {
         const accepted = candidate.accepted ? 'accepted' : 'candidate';
         const rank = candidate.alt_rank >= 0 ? `#${candidate.alt_rank + 1}` : '[rewrite]';
-        return `${rank} ${accepted} | ${String(candidate.strategy || 'candidate').replace(/_/g, ' ')} | ${displayTokenText(candidate.alt_token_text)} | avg risk ${formatPercent(candidate.avg_risk, 0)} | claim ${formatPercent(candidate.claim_risk, 0)} | ${candidate.claim_label || 'no harness'}`;
+        return `${rank} ${accepted} | ${String(candidate.strategy || 'candidate').replace(/_/g, ' ')} | ${displayTokenText(candidate.alt_token_text)} | avg risk ${formatPercent(candidate.avg_risk, 0)} | claim ${formatPercent(candidate.claim_risk, 0)} | object ${formatPercent(candidate.object_risk, 0)} | ${candidate.claim_label || 'no harness'}`;
       })
       .join('\n');
     block.appendChild(candidates);
 
     ui.interventionList.appendChild(block);
   });
+}
+
+function formatObjectEvidence(harness) {
+  if (!harness || typeof harness !== 'object') return '-';
+  if (harness.status && harness.status !== 'ok') {
+    return `Status: ${String(harness.status).replace(/_/g, ' ')}`;
+  }
+  const profile = harness.profile || {};
+  const samples = Array.isArray(harness.samples) ? harness.samples : [];
+  const lines = [
+    `Focus: ${profile.summary || '-'}`,
+    `Mode recommendation: ${String(harness.mode_recommendation || 'continue').replace(/_/g, ' ')}`,
+    `Abstain recommended: ${harness.abstain_recommended ? 'yes' : 'no'}`,
+    harness.reason_summary ? `Reason: ${harness.reason_summary}` : '',
+  ].filter(Boolean);
+  samples.forEach((sample, idx) => {
+    lines.push(
+      `Sample ${idx + 1}: ${(sample.verdict || 'uncertain').replace(/_/g, ' ')} | confidence ${(sample.confidence || 'mixed').replace(/_/g, ' ')} | `
+      + `risk ${formatPercent(sample.risk, 0)} | abstain ${sample.abstain_recommended ? 'yes' : 'no'}`
+    );
+    if (sample.reason) lines.push(`Reason ${idx + 1}: ${sample.reason}`);
+  });
+  return lines.join('\n');
+}
+
+function renderObjectHarness(result) {
+  const baselineObject = result?.object_harness?.baseline || null;
+  const correctedObject = result?.object_harness?.corrected || null;
+  const comparedLabel = Number(result?.metrics?.intervention_count ?? 0) > 0 ? 'Corrected' : 'Replay';
+
+  ui.baselineObjectRisk.textContent = formatPercent(baselineObject?.object_risk, 0);
+  ui.baselineObjectLabel.textContent = baselineObject?.label ? baselineObject.label.replace(/-/g, ' ') : (baselineObject?.status || '-').replace(/_/g, ' ');
+  ui.correctedObjectRisk.textContent = formatPercent(correctedObject?.object_risk, 0);
+  ui.correctedObjectLabel.textContent = correctedObject?.label ? correctedObject.label.replace(/-/g, ' ') : (correctedObject?.status || '-').replace(/_/g, ' ');
+
+  const focusSummary = correctedObject?.profile?.summary || baselineObject?.profile?.summary || '-';
+  ui.modeFocusObject.textContent = focusSummary;
+  const lastIntervention = Array.isArray(result?.interventions) && result.interventions.length ? result.interventions[result.interventions.length - 1] : null;
+  ui.modeCurrent.textContent = String(
+    lastIntervention?.chosen_strategy
+    || correctedObject?.mode_recommendation
+    || (Number(result?.metrics?.intervention_count ?? 0) > 0 ? 'corrected' : 'replay')
+  ).replace(/_/g, ' ');
+
+  if (baselineObject?.object_risk != null && correctedObject?.object_risk != null) {
+    ui.objectEvidence.textContent =
+      `Baseline ${formatPercent(baselineObject.object_risk, 0)} (${baselineObject.label || baselineObject.status || '-'}) vs `
+      + `${comparedLabel.toLowerCase()} ${formatPercent(correctedObject.object_risk, 0)} (${correctedObject.label || correctedObject.status || '-'}).\n\n`
+      + formatObjectEvidence(correctedObject);
+    return;
+  }
+  ui.objectEvidence.textContent = formatObjectEvidence(correctedObject || baselineObject);
 }
 
 function harnessClaimText(harness) {
@@ -590,6 +651,13 @@ function resetExperimentView() {
   ui.correctedText.textContent = '-';
   ui.interventionCount.textContent = '0';
   ui.interventionList.innerHTML = '<div class=\"empty-list\">No intervention has been triggered yet.</div>';
+  ui.modeCurrent.textContent = 'replay';
+  ui.modeFocusObject.textContent = '-';
+  ui.baselineObjectRisk.textContent = '-';
+  ui.baselineObjectLabel.textContent = '-';
+  ui.correctedObjectRisk.textContent = '-';
+  ui.correctedObjectLabel.textContent = '-';
+  ui.objectEvidence.textContent = 'No object-level evidence yet.';
   ui.harnessSummary.textContent = 'Waiting for a completed check-worthy claim before the harness can evaluate anything.';
   ui.baselineClaimRisk.textContent = '-';
   ui.baselineClaimLabel.textContent = '-';
@@ -631,14 +699,17 @@ function updateProgress(event) {
     setStatus(`Corrected token ${event.token_index + 1} on pass ${event.rewrite_pass ?? 1}`, 'neutral');
   } else if (phase === 'rewrite_candidate') {
     const run = applyProgressToken('rewritePreview', event);
-    renderCorrectedPanelFromRun(run, { title: 'Rewrite Preview' });
+    const title = event?.strategy === 'global_rewrite' ? 'Global Rewrite Preview' : 'Rewrite Preview';
+    renderCorrectedPanelFromRun(run, { title });
     setCorrectedPassState({
       rewritePass: asNumber(event.rewrite_pass, 1),
       acceptedRewrites: asNumber(event.accepted_rewrites, 0),
       loopBudget: asNumber(event.loop_budget, state.loopBudget),
-      reason: 'Evaluating a conservative rewrite candidate before acceptance.',
+      reason: event?.strategy === 'global_rewrite'
+        ? 'Evaluating a whole-answer conservative rewrite candidate before acceptance.'
+        : 'Evaluating a conservative rewrite candidate before acceptance.',
     });
-    setStatus(`Rewrite preview token ${event.token_index + 1} on pass ${event.rewrite_pass ?? 1}`, 'neutral');
+    setStatus(`${title} token ${event.token_index + 1} on pass ${event.rewrite_pass ?? 1}`, 'neutral');
   }
 }
 
@@ -669,6 +740,7 @@ function connectStream() {
       renderPassLog();
       setCorrectedPassState({ rewritePass: 1, acceptedRewrites: 0, loopBudget: state.loopBudget });
       ui.correctedTitle.textContent = 'Replay Sample';
+      ui.modeCurrent.textContent = 'replay';
       ui.baselineRunId.textContent = payload.baseline_run_id || '-';
       ui.correctedRunId.textContent = payload.corrected_run_id || '-';
       ui.experimentMeta.textContent =
@@ -728,13 +800,52 @@ function connectStream() {
       return;
     }
 
+    if (payload.type === 'live_experiment_object') {
+      if (payload.object_summary) {
+        ui.modeFocusObject.textContent = payload.object_summary;
+      }
+      if (payload.mode_recommendation) {
+        ui.modeCurrent.textContent = String(payload.mode_recommendation).replace(/_/g, ' ');
+      }
+      if (payload.phase === 'corrected') {
+        ui.correctedObjectRisk.textContent = formatPercent(payload.object_risk, 0);
+        ui.correctedObjectLabel.textContent = payload.label ? payload.label.replace(/-/g, ' ') : (payload.status || '-').replace(/_/g, ' ');
+      }
+      if (payload.target === 'baseline') {
+        ui.baselineObjectRisk.textContent = formatPercent(payload.object_risk, 0);
+        ui.baselineObjectLabel.textContent = payload.label ? payload.label.replace(/-/g, ' ') : (payload.status || '-').replace(/_/g, ' ');
+      }
+      if (payload.target === 'corrected') {
+        ui.correctedObjectRisk.textContent = formatPercent(payload.object_risk, 0);
+        ui.correctedObjectLabel.textContent = payload.label ? payload.label.replace(/-/g, ' ') : (payload.status || '-').replace(/_/g, ' ');
+      }
+      if (payload.stage === 'object_harness_completed') {
+        ui.objectEvidence.textContent =
+          `${payload.object_summary || 'Focused object'} | ${(payload.label || 'pending').replace(/-/g, ' ')} `
+          + `${payload.object_risk != null ? `(${formatPercent(payload.object_risk, 0)})` : ''}\n`
+          + `Mode recommendation: ${String(payload.mode_recommendation || 'continue').replace(/_/g, ' ')}\n`
+          + `Abstain recommended: ${payload.abstain_recommended ? 'yes' : 'no'}`
+          + (payload.reason ? `\nReason: ${payload.reason}` : '');
+      } else if (payload.stage === 'object_probe_completed') {
+        ui.objectEvidence.textContent =
+          `Object audit sample ${Number(payload.sample_index ?? 0) + 1}: ${(payload.verdict || 'uncertain').replace(/_/g, ' ')} `
+          + `${payload.object_risk != null ? `(${formatPercent(payload.object_risk, 0)})` : ''}`
+          + (payload.reason ? `\nReason: ${payload.reason}` : '');
+      } else if (payload.object_summary || payload.reason) {
+        ui.objectEvidence.textContent = [payload.object_summary, payload.reason].filter(Boolean).join('\n');
+      }
+      return;
+    }
+
     if (payload.type === 'live_experiment_candidate') {
-      if (payload.strategy === 'policy_rewrite') {
+      if (payload.strategy === 'policy_rewrite' || payload.strategy === 'global_rewrite') {
+        const isGlobal = payload.strategy === 'global_rewrite';
+        const label = isGlobal ? 'whole-answer rewrite' : 'conservative rewrite candidate';
         if (payload.stage === 'candidate_started') {
-          appendPassLog(`Pass ${payload.rewrite_pass ?? 1}: started conservative rewrite candidate.`);
+          appendPassLog(`Pass ${payload.rewrite_pass ?? 1}: started ${label}.`);
         } else if (payload.stage === 'candidate_completed') {
           appendPassLog(
-            `Pass ${payload.rewrite_pass ?? 1}: rewrite candidate decoded with avg risk ${formatPercent(payload.avg_risk, 0)}.`
+            `Pass ${payload.rewrite_pass ?? 1}: ${label} decoded with avg risk ${formatPercent(payload.avg_risk, 0)}.`
           );
         } else if (payload.stage === 'candidate_result' && payload.accepted === false) {
           const restored = applyRunSnapshot('corrected', payload.current_corrected_run);
@@ -747,9 +858,9 @@ function connectStream() {
             rewritePass: asNumber(payload.rewrite_pass, 1),
             acceptedRewrites: asNumber(payload.accepted_rewrites, 0),
             loopBudget: asNumber(payload.loop_budget, state.loopBudget),
-            reason: 'Rejected rewrite preview; returned to the current accepted path.',
+            reason: `Rejected ${label}; returned to the current accepted path.`,
           });
-          appendPassLog(`Pass ${payload.rewrite_pass ?? 1}: rewrite candidate rejected; resumed current path.`);
+          appendPassLog(`Pass ${payload.rewrite_pass ?? 1}: ${label} rejected; resumed current path.`);
         }
       }
       return;
@@ -769,7 +880,7 @@ function connectStream() {
         rewritePass: asNumber(payload.rewrite_pass, 2),
         acceptedRewrites: asNumber(payload.accepted_rewrites, 1),
         loopBudget: asNumber(payload.loop_budget, state.loopBudget),
-        reason: `Accepted rewrite at token ${payload.trigger_index} via alt ${Number(payload.chosen_alt_rank ?? 0) + 1}.`,
+        reason: `Accepted ${String(payload.chosen_strategy || 'candidate').replace(/_/g, ' ')} at token ${payload.trigger_index}.`,
       });
       state.passLog.push(
         `Pass ${payload.rewrite_pass ?? state.partialInterventions.length + 1}: accepted ${String(payload.chosen_strategy || 'candidate').replace(/_/g, ' ')} at token ${payload.trigger_index}. `
@@ -779,6 +890,9 @@ function connectStream() {
       renderPassLog();
       if (payload.baseline_harness || payload.chosen_harness) {
         renderHarness({ harness: { baseline: payload.baseline_harness, corrected: payload.chosen_harness }, metrics: { intervention_count: 1 } });
+      }
+      if (payload.baseline_object_harness || payload.chosen_object_harness) {
+        renderObjectHarness({ object_harness: { baseline: payload.baseline_object_harness, corrected: payload.chosen_object_harness }, metrics: { intervention_count: 1 } });
       }
       setStatus(`Accepted rewrite pass ${payload.rewrite_pass ?? 2} at token ${payload.trigger_index}`, 'neutral');
       return;
@@ -835,6 +949,7 @@ function renderResult(result) {
     ui.experimentSummary.textContent =
       `Baseline max risk ${formatPercent(result?.metrics?.baseline_max_risk, 0)} vs corrected ${formatPercent(result?.metrics?.corrected_max_risk, 0)}. `
       + `Claim risk: ${formatPercent(result?.metrics?.baseline_claim_risk, 0)} -> ${formatPercent(result?.metrics?.corrected_claim_risk, 0)}. `
+      + `Object risk: ${formatPercent(result?.metrics?.baseline_object_risk, 0)} -> ${formatPercent(result?.metrics?.corrected_object_risk, 0)}. `
       + `Alerts: ${result?.metrics?.baseline_alerts ?? '-'} -> ${result?.metrics?.corrected_alerts ?? '-'}. `
       + `Accepted rewrites: ${result?.metrics?.intervention_count ?? 0}/${result?.metrics?.correction_loops ?? 0}. `
       + `Use "Open In Snake Scope" to inspect both trajectories in the main visualizer.`;
@@ -842,6 +957,7 @@ function renderResult(result) {
     ui.experimentSummary.textContent =
       `No intervention fired. Baseline max risk ${formatPercent(result?.metrics?.baseline_max_risk, 0)} and replay max risk ${formatPercent(result?.metrics?.corrected_max_risk, 0)} are two matched decode samples, not evidence that a correction policy helped or hurt. `
       + `Claim risk is ${formatPercent(result?.metrics?.baseline_claim_risk, 0)} vs ${formatPercent(result?.metrics?.corrected_claim_risk, 0)}. `
+      + `Object risk is ${formatPercent(result?.metrics?.baseline_object_risk, 0)} vs ${formatPercent(result?.metrics?.corrected_object_risk, 0)}. `
       + `Accepted rewrites: 0/${result?.metrics?.correction_loops ?? 0}. `
       + `Use "Open In Snake Scope" to inspect both trajectories in the main visualizer.`;
   }
@@ -874,6 +990,7 @@ function renderResult(result) {
 
   renderInterventions(result);
   renderHarness(result);
+  renderObjectHarness(result);
 }
 
 async function probeBackend() {

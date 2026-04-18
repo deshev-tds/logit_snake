@@ -125,13 +125,31 @@
           <div class="kv"><span>Model Explicit</span><strong id="backend-model-required">-</strong></div>
           <div class="kv"><span>Stop Semantics</span><strong id="backend-stop-semantics">-</strong></div>
           <div class="kv"><span>Strict Forcing</span><strong id="backend-token-forcing">-</strong></div>
-          <div class="kv"><span>Intervention Mode</span><strong id="backend-mode">prefix_replay</strong></div>
+          <div class="kv"><span>Intervention Mode</span><strong id="backend-mode">hybrid replay / rewrite</strong></div>
         </section>
 
         <section class="subpanel">
           <h3>Interventions</h3>
           <div class="kv"><span>Count</span><strong id="intervention-count">0</strong></div>
           <div id="intervention-list"></div>
+        </section>
+
+        <section class="subpanel">
+          <h3>Mode & Object Evidence</h3>
+          <div class="kv"><span>Current Mode</span><strong id="mode-current">replay</strong></div>
+          <div class="kv"><span>Focus Object</span><strong id="mode-focus-object">-</strong></div>
+          <div class="harness-grid">
+            <div class="harness-card">
+              <div class="kv"><span>Baseline Object Risk</span><strong id="baseline-object-risk">-</strong></div>
+              <div class="kv"><span>Baseline Object Verdict</span><strong id="baseline-object-label">-</strong></div>
+            </div>
+            <div class="harness-card">
+              <div class="kv"><span>Compared Object Risk</span><strong id="corrected-object-risk">-</strong></div>
+              <div class="kv"><span>Compared Object Verdict</span><strong id="corrected-object-label">-</strong></div>
+            </div>
+          </div>
+          <div class="token-note">Object-level audit</div>
+          <div id="object-evidence" class="text-block">No object-level evidence yet.</div>
         </section>
 
         <section class="subpanel">
