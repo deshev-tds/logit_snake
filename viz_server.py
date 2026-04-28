@@ -4338,7 +4338,7 @@ class TelemetryHandler(SimpleHTTPRequestHandler):
 def main():
     parser = argparse.ArgumentParser(description="2D LLM run visualizer server")
     parser.add_argument("--host", default="127.0.0.1", help="bind host")
-    parser.add_argument("--port", type=int, default=8765, help="bind port")
+    parser.add_argument("--port", type=int, default=18765, help="bind port")
     parser.add_argument("--static-dir", default="viz", help="directory with index.html/app.js")
     parser.add_argument("--default-base-url", default="http://127.0.0.1:8080", help="default backend base URL")
     parser.add_argument("--default-max-tokens", type=int, default=256, help="default generation length")

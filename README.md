@@ -28,7 +28,7 @@ This version is intentionally **2D + time-first**:
 3. Open:
 
 ```text
-http://127.0.0.1:8765
+http://127.0.0.1:18765
 ```
 
 4. Enter endpoint + prompt and click **Generate Run**.
