@@ -18,6 +18,8 @@ const ui = {
 
   experimentMeta: document.getElementById('experiment-meta'),
   experimentSummary: document.getElementById('experiment-summary'),
+  iterationTraceSummary: document.getElementById('iteration-trace-summary'),
+  iterationTrace: document.getElementById('iteration-trace'),
   openMainLink: document.getElementById('open-main-link'),
 
   baselineRunId: document.getElementById('baseline-run-id'),
@@ -78,6 +80,10 @@ const state = {
     rewritePreview: null,
   },
   passLog: [],
+  iterationTrace: {
+    passes: [],
+    finalEvidence: null,
+  },
   loopBudget: 0,
   hoverToken: null,
 };
@@ -421,6 +427,555 @@ function appendPassLog(line) {
   renderPassLog();
 }
 
+function traceLabel(value, fallback = 'pending') {
+  const raw = String(value ?? '').trim();
+  return raw ? raw.replace(/_/g, ' ').replace(/-/g, ' ') : fallback;
+}
+
+function tracePassNumber(value, fallback = 1) {
+  const n = asNumber(value, fallback);
+  return Math.max(1, Math.floor(n || fallback || 1));
+}
+
+function resetIterationTrace(loopBudget = state.loopBudget) {
+  state.iterationTrace = {
+    passes: [],
+    finalEvidence: null,
+  };
+  state.loopBudget = asNumber(loopBudget, state.loopBudget) ?? 0;
+  ensureTracePass(1, {
+    status: 'running',
+    currentStage: 'Replay path is decoding from the original prompt.',
+    acceptedRewrites: 0,
+    acceptedBefore: 0,
+  });
+  renderIterationTrace();
+}
+
+function ensureTracePass(passNumber, seed = {}) {
+  const n = tracePassNumber(passNumber);
+  let pass = state.iterationTrace.passes.find((item) => item.passNumber === n);
+  if (!pass) {
+    pass = {
+      passNumber: n,
+      status: 'running',
+      currentStage: n === 1 ? 'Replay path is decoding from the original prompt.' : 'Continuing from the latest accepted trajectory.',
+      acceptedBefore: Math.max(0, n - 1),
+      acceptedRewrites: Math.max(0, n - 1),
+      loopBudget: state.loopBudget,
+      triggerIndex: null,
+      rollbackIndex: null,
+      tokenCount: null,
+      maxRisk: null,
+      harness: null,
+      object: null,
+      candidates: [],
+      events: [],
+      outcome: null,
+      hasLiveActivity: false,
+    };
+    state.iterationTrace.passes.push(pass);
+    state.iterationTrace.passes.sort((a, b) => a.passNumber - b.passNumber);
+  }
+  Object.assign(pass, Object.fromEntries(Object.entries(seed).filter(([, value]) => value !== undefined)));
+  return pass;
+}
+
+function appendTraceEvent(pass, line) {
+  const text = String(line || '').trim();
+  if (!pass || !text) return;
+  pass.hasLiveActivity = true;
+  const last = pass.events[pass.events.length - 1];
+  if (last === text) return;
+  pass.events.push(text);
+  if (pass.events.length > 7) pass.events = pass.events.slice(-7);
+}
+
+function traceCandidateKey(strategy, rank) {
+  const safeStrategy = String(strategy || 'candidate');
+  const safeRank = Number.isFinite(Number(rank)) ? Number(rank) : 'na';
+  return `${safeStrategy}:${safeRank}`;
+}
+
+function candidateRankFromPayload(payload) {
+  const raw = payload?.alt_rank ?? payload?.candidate_alt_rank ?? payload?.candidate_rank;
+  return Number.isFinite(Number(raw)) ? Number(raw) : null;
+}
+
+function upsertTraceCandidate(pass, payload = {}) {
+  const strategy = payload.strategy || payload.candidate_strategy || 'candidate';
+  const rank = candidateRankFromPayload(payload);
+  const key = traceCandidateKey(strategy, rank);
+  let candidate = pass.candidates.find((item) => item.key === key);
+  if (!candidate) {
+    candidate = {
+      key,
+      strategy,
+      rank,
+      tokenText: payload.alt_token_text || (rank === -1 ? '[policy rewrite]' : rank === -2 ? '[global rewrite]' : ''),
+      status: 'running',
+      avgRisk: null,
+      maxRisk: null,
+      claimRisk: null,
+      claimLabel: null,
+      objectRisk: null,
+      objectLabel: null,
+    };
+    pass.candidates.push(candidate);
+  }
+  if (payload.alt_token_text) candidate.tokenText = payload.alt_token_text;
+  if (payload.avg_risk != null) candidate.avgRisk = payload.avg_risk;
+  if (payload.max_risk != null) candidate.maxRisk = payload.max_risk;
+  if (payload.claim_risk != null) candidate.claimRisk = payload.claim_risk;
+  if (payload.claim_label) candidate.claimLabel = payload.claim_label;
+  if (payload.object_risk != null) candidate.objectRisk = payload.object_risk;
+  if (payload.object_label) candidate.objectLabel = payload.object_label;
+  if (payload.stage === 'candidate_completed') candidate.status = 'completed';
+  if (payload.stage === 'candidate_result') candidate.status = payload.accepted ? 'accepted' : 'rejected';
+  if (payload.accepted === true) candidate.status = 'accepted';
+  if (payload.accepted === false && candidate.status !== 'accepted') candidate.status = 'rejected';
+  return candidate;
+}
+
+function describeTraceHarnessEvent(payload = {}) {
+  const stage = payload.stage;
+  if (stage === 'claim_selected') return 'Selected a check-worthy claim near the risk trigger.';
+  if (stage === 'plan_ready') return `Prepared ${payload.facts_count ?? 0} factual probes.`;
+  if (stage === 'plan_fallback') return 'Used heuristic fact extraction for this claim.';
+  if (stage === 'probe_sample_completed') {
+    return `Probe ${Number(payload.probe_index ?? 0) + 1}, sample ${payload.sample_index ?? '-'} answered ${payload.answer_text || 'unknown'}.`;
+  }
+  if (stage === 'judge_completed') {
+    return `Judged detail ${Number(payload.fact_index ?? 0) + 1}: ${traceLabel(payload.verdict, 'uncertain')} ${formatPercent(payload.fact_risk, 0)}.`;
+  }
+  if (stage === 'harness_completed' || payload.claim_risk != null || payload.label) {
+    return `Claim evidence: ${traceLabel(payload.label || payload.status)} ${formatPercent(payload.claim_risk, 0)}.`;
+  }
+  return payload.message || 'Evaluating claim evidence.';
+}
+
+function describeTraceObjectEvent(payload = {}) {
+  const stage = payload.stage;
+  if (stage === 'object_selected') return `Selected object: ${payload.object_summary || 'referenced source'}.`;
+  if (stage === 'object_probe_completed') {
+    return `Object sample ${Number(payload.sample_index ?? 0) + 1}: ${traceLabel(payload.verdict, 'uncertain')} ${formatPercent(payload.object_risk, 0)}.`;
+  }
+  if (stage === 'object_harness_completed' || payload.object_risk != null || payload.label) {
+    return `Object evidence: ${traceLabel(payload.label || payload.status)} ${formatPercent(payload.object_risk, 0)}.`;
+  }
+  return payload.reason || 'Evaluating object-level evidence.';
+}
+
+function updateTraceFromStatus(payload = {}) {
+  if (payload.phase === 'baseline' || payload.phase === 'setup') return;
+  if (payload.phase === 'finalize') {
+    const final = ensureFinalEvidenceTrace();
+    final.status = 'running';
+    final.currentStage = payload.message || 'Running final evidence passes.';
+    appendFinalTraceEvent(final, payload.message || 'Running final evidence passes.');
+    renderIterationTrace();
+    return;
+  }
+  if (!payload.rewrite_pass && !payload.phase) return;
+  const pass = ensureTracePass(payload.rewrite_pass || 1, {
+    status: 'running',
+    acceptedRewrites: asNumber(payload.accepted_rewrites, undefined),
+    loopBudget: asNumber(payload.loop_budget, state.loopBudget),
+    rollbackIndex: payload.rollback_index ?? undefined,
+    triggerIndex: payload.trigger_index ?? undefined,
+  });
+  if (payload.message) {
+    pass.currentStage = payload.message;
+    appendTraceEvent(pass, payload.message);
+    if (payload.message.includes('No candidate cleared')) {
+      pass.outcome = 'No candidate cleared the acceptance gates; replay continued.';
+      pass.status = 'running';
+    }
+  }
+  renderIterationTrace();
+}
+
+function updateTraceDecodeProgress(event = {}) {
+  if (event.phase !== 'corrected') return;
+  const pass = ensureTracePass(event.rewrite_pass || 1, {
+    status: 'running',
+    tokenCount: event.token_count ?? undefined,
+    maxRisk: event.max_decoder_risk ?? undefined,
+    acceptedRewrites: asNumber(event.accepted_rewrites, undefined),
+    loopBudget: asNumber(event.loop_budget, state.loopBudget),
+  });
+  pass.currentStage = `Decoding token ${Number(event.token_index ?? 0) + 1} on this trajectory.`;
+  renderIterationTrace();
+}
+
+function updateTraceFromHarness(payload = {}) {
+  if (payload.phase === 'finalize') {
+    const final = ensureFinalEvidenceTrace();
+    final.status = 'running';
+    final.currentStage = describeTraceHarnessEvent(payload);
+    appendFinalTraceEvent(final, `${traceLabel(payload.target, 'target')} claim: ${describeTraceHarnessEvent(payload)}`);
+    renderIterationTrace();
+    return;
+  }
+  const pass = ensureTracePass(payload.rewrite_pass || 1, {
+    rollbackIndex: payload.rollback_index ?? undefined,
+    triggerIndex: payload.trigger_index ?? undefined,
+  });
+  const eventText = describeTraceHarnessEvent(payload);
+  pass.currentStage = eventText;
+  pass.harness = {
+    stage: payload.stage || pass.harness?.stage || null,
+    label: payload.label || pass.harness?.label || payload.status || null,
+    risk: payload.claim_risk ?? pass.harness?.risk ?? null,
+    claimText: payload.claim_text || pass.harness?.claimText || '',
+  };
+  const isCandidate = payload.phase === 'candidate' || payload.candidate_strategy;
+  if (isCandidate) {
+    const candidate = upsertTraceCandidate(pass, {
+      strategy: payload.candidate_strategy,
+      alt_rank: payload.candidate_alt_rank,
+      claim_risk: payload.claim_risk,
+      claim_label: payload.label,
+    });
+    candidate.status = candidate.status === 'running' ? 'completed' : candidate.status;
+  }
+  appendTraceEvent(pass, eventText);
+  renderIterationTrace();
+}
+
+function updateTraceFromObject(payload = {}) {
+  if (payload.phase === 'finalize') {
+    const final = ensureFinalEvidenceTrace();
+    final.status = 'running';
+    final.currentStage = describeTraceObjectEvent(payload);
+    appendFinalTraceEvent(final, `${traceLabel(payload.target, 'target')} object: ${describeTraceObjectEvent(payload)}`);
+    renderIterationTrace();
+    return;
+  }
+  const pass = ensureTracePass(payload.rewrite_pass || 1, {
+    rollbackIndex: payload.rollback_index ?? undefined,
+    triggerIndex: payload.trigger_index ?? undefined,
+  });
+  const eventText = describeTraceObjectEvent(payload);
+  pass.currentStage = eventText;
+  pass.object = {
+    stage: payload.stage || pass.object?.stage || null,
+    label: payload.label || pass.object?.label || payload.status || null,
+    risk: payload.object_risk ?? pass.object?.risk ?? null,
+    summary: payload.object_summary || pass.object?.summary || '',
+    modeRecommendation: payload.mode_recommendation || pass.object?.modeRecommendation || null,
+  };
+  const isCandidate = payload.phase === 'candidate' || payload.candidate_strategy;
+  if (isCandidate) {
+    const candidate = upsertTraceCandidate(pass, {
+      strategy: payload.candidate_strategy,
+      alt_rank: payload.candidate_alt_rank,
+      object_risk: payload.object_risk,
+      object_label: payload.label,
+    });
+    candidate.status = candidate.status === 'running' ? 'completed' : candidate.status;
+  }
+  appendTraceEvent(pass, eventText);
+  renderIterationTrace();
+}
+
+function updateTraceFromCandidate(payload = {}) {
+  const pass = ensureTracePass(payload.rewrite_pass || 1, {
+    rollbackIndex: payload.rollback_index ?? undefined,
+    triggerIndex: payload.trigger_index ?? undefined,
+  });
+  const candidate = upsertTraceCandidate(pass, payload);
+  const strategy = traceLabel(candidate.strategy, 'candidate');
+  if (payload.stage === 'candidate_started') {
+    pass.currentStage = `Evaluating ${strategy} candidate.`;
+    appendTraceEvent(pass, `Started ${strategy} candidate ${displayTokenText(candidate.tokenText)}.`);
+  } else if (payload.stage === 'candidate_completed') {
+    pass.currentStage = `Candidate decoded; waiting for evidence checks.`;
+    appendTraceEvent(pass, `Decoded ${strategy}: avg ${formatPercent(candidate.avgRisk, 0)}, max ${formatPercent(candidate.maxRisk, 0)}.`);
+  } else if (payload.stage === 'candidate_result') {
+    appendTraceEvent(pass, `${strategy} ${payload.accepted ? 'accepted' : 'rejected'} by acceptance gates.`);
+  }
+  renderIterationTrace();
+}
+
+function updateTraceFromIntervention(payload = {}) {
+  const nextPassNumber = tracePassNumber(payload.rewrite_pass || 2);
+  const currentPassNumber = Math.max(1, nextPassNumber - 1);
+  const pass = ensureTracePass(currentPassNumber, {
+    status: 'accepted',
+    rollbackIndex: payload.rollback_index ?? undefined,
+    triggerIndex: payload.trigger_index ?? undefined,
+  });
+  pass.outcome = `Accepted ${traceLabel(payload.chosen_strategy, 'candidate')} at trigger token ${payload.trigger_index ?? '-'}.`;
+  pass.currentStage = pass.outcome;
+  pass.acceptedRewrites = asNumber(payload.accepted_rewrites, pass.acceptedRewrites);
+  pass.outcomeMetrics = {
+    decoderBefore: payload.baseline_avg_risk,
+    decoderAfter: payload.chosen_avg_risk,
+    claimBefore: payload.baseline_claim_risk,
+    claimAfter: payload.chosen_claim_risk,
+    objectBefore: payload.baseline_object_risk,
+    objectAfter: payload.chosen_object_risk,
+  };
+  (payload.candidates || []).forEach((candidatePayload) => {
+    upsertTraceCandidate(pass, {
+      ...candidatePayload,
+      stage: 'candidate_result',
+      strategy: candidatePayload.strategy,
+      alt_rank: candidatePayload.alt_rank,
+      alt_token_text: candidatePayload.alt_token_text,
+      accepted: Boolean(candidatePayload.accepted),
+    });
+  });
+  appendTraceEvent(pass, pass.outcome);
+  ensureTracePass(nextPassNumber, {
+    status: 'running',
+    currentStage: `Continuing from accepted ${traceLabel(payload.chosen_strategy, 'candidate')} trajectory.`,
+    acceptedRewrites: asNumber(payload.accepted_rewrites, nextPassNumber - 1),
+    acceptedBefore: asNumber(payload.accepted_rewrites, nextPassNumber - 1),
+  });
+  renderIterationTrace();
+}
+
+function ensureFinalEvidenceTrace() {
+  if (!state.iterationTrace.finalEvidence) {
+    state.iterationTrace.finalEvidence = {
+      status: 'running',
+      currentStage: 'Waiting for final baseline and corrected evidence passes.',
+      events: [],
+    };
+  }
+  return state.iterationTrace.finalEvidence;
+}
+
+function appendFinalTraceEvent(final, line) {
+  const text = String(line || '').trim();
+  if (!text) return;
+  if (final.events[final.events.length - 1] === text) return;
+  final.events.push(text);
+  if (final.events.length > 8) final.events = final.events.slice(-8);
+}
+
+function finalizeIterationTrace(result = {}) {
+  const interventionCount = Number(result?.metrics?.intervention_count ?? 0);
+  const rewritePasses = Math.max(1, Number(result?.metrics?.rewrite_passes ?? interventionCount + 1));
+  state.loopBudget = asNumber(result?.metrics?.correction_loops, state.loopBudget) ?? state.loopBudget;
+  if (!state.iterationTrace.passes.length) {
+    ensureTracePass(1, { status: 'running' });
+  }
+  (result.interventions || []).forEach((item, idx) => {
+    const pass = ensureTracePass(idx + 1, {
+      status: 'accepted',
+      rollbackIndex: item.rollback_index,
+      triggerIndex: item.trigger_index,
+    });
+    pass.outcome = `Accepted ${traceLabel(item.chosen_strategy, 'candidate')} at trigger token ${item.trigger_index ?? '-'}.`;
+    pass.currentStage = pass.outcome;
+    pass.outcomeMetrics = {
+      decoderBefore: item.baseline_avg_risk,
+      decoderAfter: item.chosen_avg_risk,
+      claimBefore: item.baseline_claim_risk,
+      claimAfter: item.chosen_claim_risk,
+      objectBefore: item.baseline_object_risk,
+      objectAfter: item.chosen_object_risk,
+    };
+    pass.harness = {
+      ...(pass.harness || {}),
+      label: item.baseline_claim_label || pass.harness?.label || null,
+      risk: item.baseline_claim_risk ?? pass.harness?.risk ?? null,
+      claimText: item.baseline_claim || pass.harness?.claimText || '',
+    };
+    pass.object = {
+      ...(pass.object || {}),
+      label: item.baseline_object_label || pass.object?.label || null,
+      risk: item.baseline_object_risk ?? pass.object?.risk ?? null,
+      summary: item.baseline_object_summary || pass.object?.summary || '',
+    };
+    (item.candidates || []).forEach((candidate) => {
+      upsertTraceCandidate(pass, {
+        ...candidate,
+        stage: 'candidate_result',
+        strategy: candidate.strategy,
+        alt_rank: candidate.alt_rank,
+        alt_token_text: candidate.alt_token_text,
+        accepted: Boolean(candidate.accepted),
+      });
+    });
+    appendTraceEvent(pass, pass.outcome);
+  });
+  for (let passNumber = 1; passNumber <= rewritePasses; passNumber += 1) {
+    const pass = ensureTracePass(passNumber);
+    if (passNumber <= interventionCount) {
+      pass.status = 'accepted';
+    } else {
+      pass.status = 'complete';
+      if (!pass.outcome) {
+        pass.outcome = interventionCount > 0
+          ? 'Final trajectory completed without another accepted rewrite.'
+          : 'Replay completed without an accepted rewrite.';
+      }
+      pass.currentStage = pass.outcome;
+    }
+  }
+  const final = ensureFinalEvidenceTrace();
+  final.status = 'complete';
+  final.currentStage = 'Final baseline/corrected evidence passes completed.';
+  appendFinalTraceEvent(final, 'Final claim and object evidence are available in the evidence panels.');
+  renderIterationTrace();
+}
+
+function addTraceText(parent, className, text) {
+  if (!text) return null;
+  const node = document.createElement('div');
+  node.className = className;
+  node.textContent = text;
+  parent.appendChild(node);
+  return node;
+}
+
+function renderTraceMetric(parent, label, value) {
+  if (value == null || !Number.isFinite(Number(value))) return;
+  const node = document.createElement('span');
+  node.className = 'trace-metric';
+  node.textContent = `${label} ${formatPercent(value, 0)}`;
+  parent.appendChild(node);
+}
+
+function renderIterationTrace() {
+  if (!ui.iterationTrace) return;
+  const passes = [...state.iterationTrace.passes].sort((a, b) => a.passNumber - b.passNumber);
+  const final = state.iterationTrace.finalEvidence;
+  const acceptedCount = passes.filter((pass) => pass.status === 'accepted').length;
+  const activePass = [...passes].reverse().find((pass) => pass.status === 'running');
+  const summaryBits = [
+    `${passes.length || 0} pass${passes.length === 1 ? '' : 'es'}`,
+    `accepted ${acceptedCount}/${Math.max(0, Number(state.loopBudget || 0))}`,
+  ];
+  if (final?.status === 'running') {
+    summaryBits.push('final evidence running');
+  } else if (activePass) {
+    summaryBits.push(`current pass ${activePass.passNumber}`);
+  }
+  ui.iterationTraceSummary.textContent = summaryBits.join(' | ');
+
+  ui.iterationTrace.innerHTML = '';
+  if (!passes.length && !final) {
+    const empty = document.createElement('div');
+    empty.className = 'empty-list';
+    empty.textContent = 'Run an experiment to see each replay, evidence, candidate, and rewrite decision.';
+    ui.iterationTrace.appendChild(empty);
+    return;
+  }
+
+  passes.forEach((pass) => {
+    const block = document.createElement('article');
+    block.className = `trace-pass ${pass.status || 'running'}`;
+
+    const head = document.createElement('div');
+    head.className = 'trace-head';
+    const title = document.createElement('div');
+    title.className = 'trace-title';
+    title.textContent = `Pass ${pass.passNumber}`;
+    const pill = document.createElement('span');
+    pill.className = 'trace-pill';
+    pill.textContent = traceLabel(pass.status, 'running');
+    head.append(title, pill);
+    block.appendChild(head);
+
+    const meta = document.createElement('div');
+    meta.className = 'trace-meta';
+    const metaItems = [
+      pass.passNumber === 1 ? 'starts from raw replay' : 'starts from accepted trajectory',
+      `accepted before ${Math.max(0, pass.acceptedBefore ?? pass.passNumber - 1)}/${Math.max(0, Number(state.loopBudget || 0))}`,
+    ];
+    if (pass.tokenCount != null) metaItems.push(`tokens ${pass.tokenCount}`);
+    if (pass.rollbackIndex != null) metaItems.push(`rollback ${pass.rollbackIndex}`);
+    if (pass.triggerIndex != null) metaItems.push(`trigger ${pass.triggerIndex}`);
+    meta.textContent = metaItems.join(' | ');
+    block.appendChild(meta);
+
+    addTraceText(block, 'trace-step', pass.currentStage || pass.outcome || 'Waiting for activity on this pass.');
+    if (pass.harness?.claimText) {
+      addTraceText(block, 'trace-claim', `Claim: ${pass.harness.claimText}`);
+    }
+    if (pass.object?.summary) {
+      addTraceText(block, 'trace-claim', `Object: ${pass.object.summary}`);
+    }
+
+    const metrics = document.createElement('div');
+    metrics.className = 'trace-metrics';
+    renderTraceMetric(metrics, 'max', pass.maxRisk);
+    renderTraceMetric(metrics, 'claim', pass.harness?.risk);
+    renderTraceMetric(metrics, 'object', pass.object?.risk);
+    if (pass.outcomeMetrics) {
+      renderTraceMetric(metrics, 'decoder before', pass.outcomeMetrics.decoderBefore);
+      renderTraceMetric(metrics, 'decoder after', pass.outcomeMetrics.decoderAfter);
+      renderTraceMetric(metrics, 'claim after', pass.outcomeMetrics.claimAfter);
+      renderTraceMetric(metrics, 'object after', pass.outcomeMetrics.objectAfter);
+    }
+    if (metrics.childElementCount) block.appendChild(metrics);
+
+    if (pass.candidates.length) {
+      const candidates = document.createElement('div');
+      candidates.className = 'trace-candidates';
+      pass.candidates.forEach((candidate) => {
+        const row = document.createElement('div');
+        row.className = `trace-candidate-row ${candidate.status || 'running'}`;
+        const kind = document.createElement('span');
+        kind.textContent = traceLabel(candidate.strategy, 'candidate');
+        const token = document.createElement('span');
+        token.className = 'trace-token';
+        token.textContent = displayTokenText(candidate.tokenText || (candidate.rank >= 0 ? `alt ${candidate.rank + 1}` : '[rewrite]'));
+        const avg = document.createElement('span');
+        avg.textContent = `avg ${formatPercent(candidate.avgRisk, 0)}`;
+        const claim = document.createElement('span');
+        claim.textContent = `claim ${formatPercent(candidate.claimRisk, 0)}`;
+        const object = document.createElement('span');
+        object.textContent = `object ${formatPercent(candidate.objectRisk, 0)}`;
+        const status = document.createElement('span');
+        status.textContent = traceLabel(candidate.status, 'running');
+        row.append(kind, token, avg, claim, object, status);
+        candidates.appendChild(row);
+      });
+      block.appendChild(candidates);
+    }
+
+    if (pass.events.length) {
+      const events = document.createElement('div');
+      events.className = 'trace-events';
+      pass.events.slice(-4).forEach((line) => {
+        addTraceText(events, 'trace-event', line);
+      });
+      block.appendChild(events);
+    }
+
+    ui.iterationTrace.appendChild(block);
+  });
+
+  if (final) {
+    const block = document.createElement('article');
+    block.className = `trace-final ${final.status || 'running'}`;
+    const head = document.createElement('div');
+    head.className = 'trace-head';
+    const title = document.createElement('div');
+    title.className = 'trace-title';
+    title.textContent = 'Final Evidence';
+    const pill = document.createElement('span');
+    pill.className = 'trace-pill';
+    pill.textContent = traceLabel(final.status, 'running');
+    head.append(title, pill);
+    block.appendChild(head);
+    addTraceText(block, 'trace-step', final.currentStage);
+    if (final.events.length) {
+      const events = document.createElement('div');
+      events.className = 'trace-events';
+      final.events.slice(-5).forEach((line) => addTraceText(events, 'trace-event', line));
+      block.appendChild(events);
+    }
+    ui.iterationTrace.appendChild(block);
+  }
+}
+
 function setCorrectedPassState({ rewritePass = 1, acceptedRewrites = 0, loopBudget = state.loopBudget, reason = '' } = {}) {
   state.loopBudget = asNumber(loopBudget, state.loopBudget) ?? 0;
   const maxPasses = 1 + Math.max(0, Number(state.loopBudget || 0));
@@ -630,10 +1185,13 @@ function resetExperimentView() {
   state.partialInterventions = [];
   state.partialRuns = { baseline: null, corrected: null, rewritePreview: null };
   state.passLog = [];
+  state.iterationTrace = { passes: [], finalEvidence: null };
   state.loopBudget = 0;
   hideTokenTooltip();
   ui.experimentMeta.textContent = 'Experiment is running...';
   ui.experimentSummary.textContent = 'Waiting for the first token-level updates from the live experiment loop.';
+  ui.iterationTraceSummary.textContent = 'Waiting for correction loop activity.';
+  ui.iterationTrace.innerHTML = '<div class=\"empty-list\">Waiting for replay, evidence, candidate, and rewrite events.</div>';
   ui.baselineRunId.textContent = '-';
   ui.baselineRisk.textContent = '-';
   ui.baselineAlerts.textContent = '-';
@@ -685,6 +1243,7 @@ function updateProgress(event) {
     setStatus(`Baseline token ${event.token_index + 1}`, 'neutral');
   } else if (phase === 'corrected') {
     const run = applyProgressToken('corrected', event);
+    updateTraceDecodeProgress(event);
     renderCorrectedPanelFromRun(run, {
       title: Number(event.accepted_rewrites ?? 0) > 0 ? 'Corrected Candidate' : 'Replay Sample',
     });
@@ -737,6 +1296,7 @@ function connectStream() {
     if (payload.type === 'live_experiment_started') {
       state.loopBudget = asNumber(payload.correction_loops, 0) ?? 0;
       state.passLog = ['Pass 1 started from the raw replay path.'];
+      resetIterationTrace(state.loopBudget);
       renderPassLog();
       setCorrectedPassState({ rewritePass: 1, acceptedRewrites: 0, loopBudget: state.loopBudget });
       ui.correctedTitle.textContent = 'Replay Sample';
@@ -760,6 +1320,7 @@ function connectStream() {
       if (payload.message) {
         setStatus(`${payload.message}${seconds}`, 'neutral');
       }
+      updateTraceFromStatus(payload);
       if (payload.phase === 'rewrite_candidate') {
         setCorrectedPassState({
           rewritePass: asNumber(payload.rewrite_pass, 1),
@@ -772,6 +1333,7 @@ function connectStream() {
     }
 
     if (payload.type === 'live_experiment_harness') {
+      updateTraceFromHarness(payload);
       if (payload.stage) {
         const stage = String(payload.stage);
         if (stage === 'probe_sample_completed') {
@@ -801,6 +1363,7 @@ function connectStream() {
     }
 
     if (payload.type === 'live_experiment_object') {
+      updateTraceFromObject(payload);
       if (payload.object_summary) {
         ui.modeFocusObject.textContent = payload.object_summary;
       }
@@ -838,6 +1401,7 @@ function connectStream() {
     }
 
     if (payload.type === 'live_experiment_candidate') {
+      updateTraceFromCandidate(payload);
       if (payload.strategy === 'policy_rewrite' || payload.strategy === 'global_rewrite') {
         const isGlobal = payload.strategy === 'global_rewrite';
         const label = isGlobal ? 'whole-answer rewrite' : 'conservative rewrite candidate';
@@ -867,8 +1431,11 @@ function connectStream() {
     }
 
     if (payload.type === 'live_experiment_intervention') {
+      updateTraceFromIntervention(payload);
       state.partialInterventions.push(payload);
       renderPartialInterventions();
+      const acceptedPass = Math.max(1, asNumber(payload.rewrite_pass, 2) - 1);
+      const nextPass = acceptedPass + 1;
       if (payload.corrected_run) {
         const run = applyRunSnapshot('corrected', payload.corrected_run);
         renderCorrectedPanelFromRun(run, { title: 'Corrected Candidate' });
@@ -883,7 +1450,7 @@ function connectStream() {
         reason: `Accepted ${String(payload.chosen_strategy || 'candidate').replace(/_/g, ' ')} at token ${payload.trigger_index}.`,
       });
       state.passLog.push(
-        `Pass ${payload.rewrite_pass ?? state.partialInterventions.length + 1}: accepted ${String(payload.chosen_strategy || 'candidate').replace(/_/g, ' ')} at token ${payload.trigger_index}. `
+        `Pass ${acceptedPass}: accepted ${String(payload.chosen_strategy || 'candidate').replace(/_/g, ' ')} at token ${payload.trigger_index}; pass ${nextPass} starts from that trajectory. `
         + `Decoder ${formatPercent(payload.baseline_avg_risk, 0)} -> ${formatPercent(payload.chosen_avg_risk, 0)} | `
         + `claim ${formatPercent(payload.baseline_claim_risk, 0)} -> ${formatPercent(payload.chosen_claim_risk, 0)}.`
       );
@@ -894,12 +1461,13 @@ function connectStream() {
       if (payload.baseline_object_harness || payload.chosen_object_harness) {
         renderObjectHarness({ object_harness: { baseline: payload.baseline_object_harness, corrected: payload.chosen_object_harness }, metrics: { intervention_count: 1 } });
       }
-      setStatus(`Accepted rewrite pass ${payload.rewrite_pass ?? 2} at token ${payload.trigger_index}`, 'neutral');
+      setStatus(`Accepted rewrite after pass ${acceptedPass} at token ${payload.trigger_index}`, 'neutral');
       return;
     }
 
     if (payload.type === 'live_experiment_completed') {
       renderResult(payload);
+      finalizeIterationTrace(payload);
       setStatus('Experiment completed.', 'success');
     }
   };
@@ -924,7 +1492,7 @@ function renderResult(result) {
   }
   if (interventionCount > 0) {
     const fromResult = (result?.interventions || []).map((item, idx) =>
-      `Pass ${idx + 2}: accepted ${String(item.chosen_strategy || 'candidate').replace(/_/g, ' ')} at token ${item.trigger_index}. `
+      `Pass ${idx + 1}: accepted ${String(item.chosen_strategy || 'candidate').replace(/_/g, ' ')} at token ${item.trigger_index}; pass ${idx + 2} starts from that trajectory. `
       + `Decoder ${formatPercent(item.baseline_avg_risk, 0)} -> ${formatPercent(item.chosen_avg_risk, 0)} | `
       + `claim ${formatPercent(item.baseline_claim_risk, 0)} -> ${formatPercent(item.chosen_claim_risk, 0)}.`
     );
@@ -1055,6 +1623,7 @@ async function runExperiment() {
       policy,
     });
     renderResult(result);
+    finalizeIterationTrace(result);
     setStatus('Experiment completed.', 'success');
   } catch (err) {
     setStatus(`Experiment failed: ${err.message}`, 'error');

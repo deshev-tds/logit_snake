@@ -20,10 +20,21 @@ find_app_pids() {
     if [[ "$command" == *"$ROOT_DIR/$APP_NAME"* ]] ||
        [[ "$command" == *"$ROOT_DIR_REAL/$APP_NAME"* ]] ||
        [[ "$command" == *"--static-dir $ROOT_DIR/viz"* ]] ||
-       [[ "$command" == *"--static-dir $ROOT_DIR_REAL/viz"* ]]; then
+       [[ "$command" == *"--static-dir $ROOT_DIR_REAL/viz"* ]] ||
+       [[ "$command" == *"$APP_NAME --"* && "$command" == *"--static-dir ./viz"* ]]; then
       echo "$pid"
     fi
   done
+}
+
+server_is_ready() {
+  local pid="$1"
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -nP -a -p "$pid" -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1
+    return $?
+  fi
+
+  curl --silent --fail --max-time 1 "http://$HOST:$PORT/" >/dev/null 2>&1
 }
 
 stop_pids() {
@@ -64,22 +75,62 @@ start_server() {
 
   cleanup_old_instances
 
-  nohup "$PYTHON_BIN" "$ROOT_DIR/viz_server.py" \
-    --host "$HOST" \
-    --port "$PORT" \
-    --static-dir "$ROOT_DIR/viz" \
-    --default-base-url "$DEFAULT_BASE_URL" \
-    >"$LOG_FILE" 2>&1 &
-  echo $! > "$PID_FILE"
+  PID="$(
+    VIZ_PYTHON_BIN="$PYTHON_BIN" \
+    VIZ_ROOT_DIR="$ROOT_DIR" \
+    VIZ_HOST="$HOST" \
+    VIZ_PORT="$PORT" \
+    VIZ_DEFAULT_BASE_URL="$DEFAULT_BASE_URL" \
+    VIZ_LOG_FILE="$LOG_FILE" \
+    "$PYTHON_BIN" -c '
+import os
+import subprocess
 
-  sleep 0.2
-  if ! kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-    rm -f "$PID_FILE"
-    echo "viz_server failed to start; see $LOG_FILE"
-    return 1
+log = open(os.environ["VIZ_LOG_FILE"], "ab", buffering=0)
+cmd = [
+    os.environ["VIZ_PYTHON_BIN"],
+    os.path.join(os.environ["VIZ_ROOT_DIR"], "viz_server.py"),
+    "--host",
+    os.environ["VIZ_HOST"],
+    "--port",
+    os.environ["VIZ_PORT"],
+    "--static-dir",
+    os.path.join(os.environ["VIZ_ROOT_DIR"], "viz"),
+    "--default-base-url",
+    os.environ["VIZ_DEFAULT_BASE_URL"],
+]
+proc = subprocess.Popen(
+    cmd,
+    stdin=subprocess.DEVNULL,
+    stdout=log,
+    stderr=subprocess.STDOUT,
+    close_fds=True,
+    start_new_session=True,
+)
+print(proc.pid)
+'
+  )"
+  echo "$PID" > "$PID_FILE"
+
+  for _ in {1..25}; do
+    if ! kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+      rm -f "$PID_FILE"
+      echo "viz_server failed to start; see $LOG_FILE"
+      return 1
+    fi
+    if server_is_ready "$(cat "$PID_FILE")"; then
+      echo "viz_server started on http://$HOST:$PORT (pid $(cat "$PID_FILE")), default base URL: $DEFAULT_BASE_URL"
+      return 0
+    fi
+    sleep 0.2
+  done
+
+  if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+    kill "$(cat "$PID_FILE")" 2>/dev/null || true
   fi
-
-  echo "viz_server started on http://$HOST:$PORT (pid $(cat "$PID_FILE")), default base URL: $DEFAULT_BASE_URL"
+  rm -f "$PID_FILE"
+  echo "viz_server did not become ready on http://$HOST:$PORT; see $LOG_FILE"
+  return 1
 }
 
 stop_server() {
