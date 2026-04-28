@@ -168,6 +168,19 @@ button.accent {
   color: #035361;
 }
 
+button.danger {
+  border-color: #d9a29b;
+  background: #fff3f1;
+  color: #8d2419;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+  transform: none;
+  box-shadow: none;
+}
+
 #action-row {
   display: flex;
   flex-wrap: wrap;
@@ -555,7 +568,12 @@ kbd {
   border-left-color: #4f9b72;
 }
 
-.trace-pass.skipped {
+.trace-pass.stopped {
+  border-left-color: var(--danger);
+}
+
+.trace-pass.skipped,
+.trace-final.skipped {
   border-left-color: #a9b6c4;
 }
 

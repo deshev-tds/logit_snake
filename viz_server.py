@@ -30,6 +30,8 @@ GEN_LOCK = threading.Lock()
 GEN_THREAD = None
 GEN_STOP = None
 GEN_RUN_ID = None
+LIVE_STOP = None
+LIVE_EXPERIMENT_ID = None
 
 DEFAULTS = {}
 BACKEND_PROBE_CACHE = {}
@@ -1316,6 +1318,35 @@ def generate_single_token_step(base_url, prompt, settings, model_name, prompt_ha
     return token, stop_info, model_name
 
 
+def live_decode_stop_reason(run, token, stop_info, remaining):
+    if stop_info.get("hard_stop"):
+        return "backend hard stop"
+    if stop_info.get("stop") and remaining <= 0:
+        return "token budget reached"
+
+    token_text = str((token or {}).get("text") or (token or {}).get("chosen_token_text") or "")
+    eos_markers = {
+        "</s>",
+        "<|endoftext|>",
+        "<|end_of_text|>",
+        "<|eot_id|>",
+        "<|im_end|>",
+        "<|end|>",
+    }
+    if token_text.strip() in eos_markers:
+        return "generated EOS marker"
+
+    tokens = run.get("tokens") or []
+    if len(tokens) >= 6:
+        trailing = [str(t.get("text") or "") for t in tokens[-6:]]
+        text_so_far = joined_run_text(run).rstrip()
+        if text_so_far.endswith((".", "!", "?", "\"", "'", ")", "]")) and all(not item.strip() for item in trailing[-4:]):
+            return "trailing whitespace after completed answer"
+        if len(set(trailing)) == 1 and trailing[0] in ("", " ", "\n", "\n\n"):
+            return "repeated trailing whitespace"
+    return None
+
+
 def add_token_local(run, token):
     run["tokens"].append(token)
     run["meta"]["providers"]["topN"] = token.get("topn_provider", run["meta"]["providers"].get("topN"))
@@ -1700,7 +1731,7 @@ def build_claim_probe_plan(base_url, model_name, settings, claim, context_text, 
     return plan
 
 
-def run_probe_answers(base_url, model_name, settings, question, policy, probe_index, progress_cb=None, progress_context=None):
+def run_probe_answers(base_url, model_name, settings, question, policy, probe_index, progress_cb=None, progress_context=None, stop_event=None):
     answers = []
     context = dict(progress_context or {})
 
@@ -1713,6 +1744,8 @@ def run_probe_answers(base_url, model_name, settings, question, policy, probe_in
         progress_cb(payload)
 
     for sample_index in range(policy["harness_samples"]):
+        if stop_event is not None and stop_event.is_set():
+            break
         prompt = (
             "Answer the factual question with a short phrase only.\n"
             'If the answer is unknown or unstable, answer exactly: unknown\n'
@@ -1744,7 +1777,7 @@ def run_probe_answers(base_url, model_name, settings, question, policy, probe_in
     return answers, model_name
 
 
-def judge_probe_fact(base_url, model_name, settings, claim, fact_detail, question, answers, policy, fact_index, progress_cb=None, progress_context=None):
+def judge_probe_fact(base_url, model_name, settings, claim, fact_detail, question, answers, policy, fact_index, progress_cb=None, progress_context=None, stop_event=None):
     context = dict(progress_context or {})
 
     def emit(stage, **extra):
@@ -1754,6 +1787,17 @@ def judge_probe_fact(base_url, model_name, settings, claim, fact_detail, questio
         payload.update(extra)
         payload["stage"] = stage
         progress_cb(payload)
+
+    if stop_event is not None and stop_event.is_set():
+        return {
+            "verdict": "uncertain",
+            "agreement": "mixed",
+            "canonical_answer": None,
+            "reason": "stopped",
+            "fact_risk": 0.52,
+            "raw_response": "",
+            "model": model_name,
+        }
 
     prompt = (
         "You are checking whether a factual detail from a generated claim is stable.\n"
@@ -1823,10 +1867,12 @@ def judge_probe_fact(base_url, model_name, settings, claim, fact_detail, questio
     return result
 
 
-def run_claim_harness(run, focus_token_index, policy, progress_cb=None, progress_context=None):
+def run_claim_harness(run, focus_token_index, policy, progress_cb=None, progress_context=None, stop_event=None):
     tokens = run.get("tokens") or []
     if not tokens:
         return {"status": "no_tokens"}
+    if stop_event is not None and stop_event.is_set():
+        return {"status": "stopped"}
 
     context = dict(progress_context or {})
 
@@ -1859,6 +1905,8 @@ def run_claim_harness(run, focus_token_index, policy, progress_cb=None, progress
     context_start = max(0, claim_span["start"] - 280)
     context_text = text[context_start : claim_span["start"]].strip()
     emit("claim_selected", focus_token_index=focus_token_index, claim_text=claim_span.get("text"), claim_token_start=claim_span.get("token_start"))
+    if stop_event is not None and stop_event.is_set():
+        return {"status": "stopped", "focus_token_index": focus_token_index, "claim": claim_span}
 
     if not claim_span.get("checkworthy"):
         result = {
@@ -1879,6 +1927,8 @@ def run_claim_harness(run, focus_token_index, policy, progress_cb=None, progress
         progress_cb=progress_cb,
         progress_context={**context, "focus_token_index": focus_token_index},
     )
+    if stop_event is not None and stop_event.is_set():
+        return {"status": "stopped", "focus_token_index": focus_token_index, "claim": claim_span, "plan": plan}
     if not plan.get("checkworthy") or not plan.get("facts"):
         result = {
             "status": "not_checkworthy",
@@ -1892,6 +1942,8 @@ def run_claim_harness(run, focus_token_index, policy, progress_cb=None, progress
     facts = []
     current_model = plan.get("model") or model_name
     for fact_index, item in enumerate(plan["facts"]):
+        if stop_event is not None and stop_event.is_set():
+            return {"status": "stopped", "focus_token_index": focus_token_index, "claim": claim_span, "plan": plan, "facts": facts}
         answers, current_model = run_probe_answers(
             base_url,
             current_model,
@@ -1901,7 +1953,10 @@ def run_claim_harness(run, focus_token_index, policy, progress_cb=None, progress
             fact_index,
             progress_cb=progress_cb,
             progress_context={**context, "focus_token_index": focus_token_index, "fact_detail": item["fact"]},
+            stop_event=stop_event,
         )
+        if stop_event is not None and stop_event.is_set():
+            return {"status": "stopped", "focus_token_index": focus_token_index, "claim": claim_span, "plan": plan, "facts": facts}
         judgement = judge_probe_fact(
             base_url,
             current_model,
@@ -1914,6 +1969,7 @@ def run_claim_harness(run, focus_token_index, policy, progress_cb=None, progress
             fact_index,
             progress_cb=progress_cb,
             progress_context={**context, "focus_token_index": focus_token_index, "fact_detail": item["fact"]},
+            stop_event=stop_event,
         )
         current_model = judgement.get("model") or current_model
         facts.append(
@@ -2119,10 +2175,12 @@ def parse_object_harness_response(raw_text):
     }
 
 
-def run_object_harness(run, policy, progress_cb=None, progress_context=None):
+def run_object_harness(run, policy, progress_cb=None, progress_context=None, stop_event=None):
     tokens = run.get("tokens") or []
     if not tokens:
         return {"status": "no_tokens"}
+    if stop_event is not None and stop_event.is_set():
+        return {"status": "stopped"}
 
     context = dict(progress_context or {})
 
@@ -2161,10 +2219,14 @@ def run_object_harness(run, policy, progress_cb=None, progress_context=None):
     requested = ", ".join(profile.get("requested_fields") or []) or "none"
 
     emit("object_selected", profile=profile, object_summary=profile.get("summary"))
+    if stop_event is not None and stop_event.is_set():
+        return {"status": "stopped", "profile": profile}
 
     samples = []
     current_model = model_name
     for sample_index in range(policy["harness_samples"]):
+        if stop_event is not None and stop_event.is_set():
+            return {"status": "stopped", "profile": profile, "samples": samples}
         sample_settings = copy.deepcopy(settings)
         sample_settings["temperature"] = 0.12
         sample_settings["top_p"] = 0.9
@@ -2198,6 +2260,8 @@ def run_object_harness(run, policy, progress_cb=None, progress_context=None):
             sample_settings,
             model_name=current_model,
         )
+        if stop_event is not None and stop_event.is_set():
+            return {"status": "stopped", "profile": profile, "samples": samples}
         parsed = parse_object_harness_response(raw_text)
         verdict = parsed["verdict"]
         confidence = parsed["confidence"]
@@ -2231,6 +2295,9 @@ def run_object_harness(run, policy, progress_cb=None, progress_context=None):
             object_risk=sample["risk"],
             reason=sample["reason"],
         )
+
+    if not samples:
+        return {"status": "stopped" if stop_event is not None and stop_event.is_set() else "no_evidence", "profile": profile, "samples": samples}
 
     sample_risks = [float(sample["risk"]) for sample in samples]
     mean_risk = sum(sample_risks) / len(sample_risks)
@@ -2319,7 +2386,7 @@ def live_token_snapshot(token):
     return snapshot
 
 
-def decode_candidate_until_claim(run, focus_token_index, max_new_tokens=None):
+def decode_candidate_until_claim(run, focus_token_index, max_new_tokens=None, stop_event=None):
     started = time.monotonic()
     initialize_prefill_tokens(run)
 
@@ -2348,7 +2415,7 @@ def decode_candidate_until_claim(run, focus_token_index, max_new_tokens=None):
     if max_new_tokens is not None:
         remaining = min(remaining, max(0, int(max_new_tokens)))
 
-    while remaining > 0:
+    while remaining > 0 and not (stop_event is not None and stop_event.is_set()):
         token, stop_info, model_name = generate_single_token_step(
             base_url,
             inference_prompt + generated_text,
@@ -2381,16 +2448,16 @@ def decode_candidate_until_claim(run, focus_token_index, max_new_tokens=None):
         if claim is not None and claim.get("token_end") is not None and claim["token_end"] >= focus_token_index:
             break
 
-        if stop_info.get("hard_stop"):
-            break
-        if stop_info.get("stop") and remaining <= 0:
+        stop_reason = live_decode_stop_reason(run, token, stop_info, remaining)
+        if stop_reason:
+            run.setdefault("meta", {}).setdefault("stop", {})["reason"] = stop_reason
             break
 
-    finalize_completed_run(run, started, status="complete")
+    finalize_completed_run(run, started, status="stopped" if stop_event is not None and stop_event.is_set() else "complete")
     return run
 
 
-def decode_run_local(run, max_new_tokens=None, progress_cb=None, phase=None):
+def decode_run_local(run, max_new_tokens=None, progress_cb=None, phase=None, stop_event=None):
     started = time.monotonic()
     initialize_prefill_tokens(run)
 
@@ -2419,7 +2486,7 @@ def decode_run_local(run, max_new_tokens=None, progress_cb=None, phase=None):
     if max_new_tokens is not None:
         remaining = min(remaining, max(0, int(max_new_tokens)))
 
-    while remaining > 0:
+    while remaining > 0 and not (stop_event is not None and stop_event.is_set()):
         token, stop_info, model_name = generate_single_token_step(
             base_url,
             inference_prompt + generated_text,
@@ -2470,12 +2537,12 @@ def decode_run_local(run, max_new_tokens=None, progress_cb=None, phase=None):
         token_index += 1
         remaining -= 1
 
-        if stop_info.get("hard_stop"):
-            break
-        if stop_info.get("stop") and remaining <= 0:
+        stop_reason = live_decode_stop_reason(run, token, stop_info, remaining)
+        if stop_reason:
+            run.setdefault("meta", {}).setdefault("stop", {})["reason"] = stop_reason
             break
 
-    finalize_completed_run(run, started, status="complete")
+    finalize_completed_run(run, started, status="stopped" if stop_event is not None and stop_event.is_set() else "complete")
     return run
 
 
@@ -2702,15 +2769,18 @@ def start_run_generation(run):
 
 
 def stop_generation():
-    global GEN_THREAD, GEN_STOP, GEN_RUN_ID
+    global GEN_THREAD, GEN_STOP, GEN_RUN_ID, LIVE_STOP, LIVE_EXPERIMENT_ID
 
     with GEN_LOCK:
         thread = GEN_THREAD
         stop_event = GEN_STOP
         run_id = GEN_RUN_ID
+        live_stop = LIVE_STOP
 
     if stop_event is not None:
         stop_event.set()
+    if live_stop is not None:
+        live_stop.set()
     if thread is not None and thread.is_alive() and thread is not threading.current_thread():
         thread.join(timeout=3)
 
@@ -2719,6 +2789,8 @@ def stop_generation():
             GEN_THREAD = None
             GEN_STOP = None
             GEN_RUN_ID = None
+        if LIVE_STOP is live_stop and live_stop is not None and live_stop.is_set():
+            LIVE_EXPERIMENT_ID = None
 
     if run_id:
         with RUNS_LOCK:
@@ -2902,7 +2974,7 @@ def rollback_index_for_run(run, policy):
     return rollback_index, current_avg_risk
 
 
-def run_candidate_branch(parent_run, rollback_index, alt_rank, lookahead):
+def run_candidate_branch(parent_run, rollback_index, alt_rank, lookahead, stop_event=None):
     parent_tokens = parent_run.get("tokens") or []
     if rollback_index < 0 or rollback_index >= len(parent_tokens):
         return None
@@ -2933,7 +3005,7 @@ def run_candidate_branch(parent_run, rollback_index, alt_rank, lookahead):
         prefill_tokens=prefill_tokens,
         inference_prompt=inference_prompt,
     )
-    decode_candidate_until_claim(run, rollback_index, max_new_tokens=lookahead)
+    decode_candidate_until_claim(run, rollback_index, max_new_tokens=lookahead, stop_event=stop_event)
 
     candidate_window = run.get("tokens", [])[rollback_index:]
     risks = [float(t.get("decoder_risk") or 0.0) for t in candidate_window] if candidate_window else []
@@ -3008,7 +3080,7 @@ def format_object_harness_evidence_for_prompt(object_harness):
     return "\n".join(lines)
 
 
-def run_policy_rewrite_candidate(parent_run, current_harness, rollback_index, policy, progress_cb=None):
+def run_policy_rewrite_candidate(parent_run, current_harness, rollback_index, policy, progress_cb=None, stop_event=None):
     claim = (current_harness or {}).get("claim") or {}
     claim_token_start = claim.get("token_start")
     if claim_token_start is None:
@@ -3072,6 +3144,7 @@ def run_policy_rewrite_candidate(parent_run, current_harness, rollback_index, po
         max_new_tokens=max_new_tokens,
         progress_cb=progress_cb,
         phase="rewrite_candidate",
+        stop_event=stop_event,
     )
 
     candidate_window = run.get("tokens", [])[claim_token_start:]
@@ -3089,7 +3162,7 @@ def run_policy_rewrite_candidate(parent_run, current_harness, rollback_index, po
     }
 
 
-def run_global_rewrite_candidate(parent_run, current_harness, object_harness, policy, progress_cb=None):
+def run_global_rewrite_candidate(parent_run, current_harness, object_harness, policy, progress_cb=None, stop_event=None):
     prompt = parent_run.get("meta", {}).get("prompt", "")
     current_text = joined_run_text(parent_run)
     risky_claim_text = ((current_harness or {}).get("standalone_claim") or (((current_harness or {}).get("claim") or {}).get("text")) or "").strip()
@@ -3143,6 +3216,7 @@ def run_global_rewrite_candidate(parent_run, current_harness, object_harness, po
         run,
         progress_cb=wrapped_progress,
         phase="rewrite_candidate",
+        stop_event=stop_event,
     )
 
     candidate_window = run.get("tokens", [])
@@ -3160,7 +3234,12 @@ def run_global_rewrite_candidate(parent_run, current_harness, object_harness, po
     }
 
 
-def run_live_correction_experiment(prompt, base_url, settings, policy, experiment_id=None):
+def run_live_correction_experiment(prompt, base_url, settings, policy, experiment_id=None, stop_event=None):
+    stop_event = stop_event or threading.Event()
+
+    def stop_requested():
+        return bool(stop_event and stop_event.is_set())
+
     def progress(event_type, payload):
         if not experiment_id:
             return
@@ -3222,7 +3301,10 @@ def run_live_correction_experiment(prompt, base_url, settings, policy, experimen
             baseline,
             progress_cb=lambda payload: progress("live_experiment_progress", payload),
             phase="baseline",
+            stop_event=stop_event,
         )
+        if stop_requested():
+            update_status("Stop requested after baseline decode.", phase="stopped", rewrite_pass=1, accepted_rewrites=0)
 
         started = time.monotonic()
         initialize_prefill_tokens(corrected)
@@ -3310,7 +3392,7 @@ def run_live_correction_experiment(prompt, base_url, settings, policy, experimen
                 )
             return "Evaluating whether the referenced object is stable enough to answer directly."
 
-        while remaining > 0:
+        while remaining > 0 and not stop_requested():
             token, stop_info, model_name = generate_single_token_step(
                 base_url,
                 inference_prompt + generated_text,
@@ -3365,6 +3447,19 @@ def run_live_correction_experiment(prompt, base_url, settings, policy, experimen
                 },
             )
 
+            decode_stop_reason = live_decode_stop_reason(corrected, token, stop_info, remaining)
+            if decode_stop_reason:
+                corrected.setdefault("meta", {}).setdefault("stop", {})["reason"] = decode_stop_reason
+                if decode_stop_reason not in ("backend hard stop", "token budget reached"):
+                    update_status(
+                        f"Stopped corrected decode: {decode_stop_reason}.",
+                        phase="corrected",
+                        rewrite_pass=len(interventions) + 1,
+                        accepted_rewrites=len(interventions),
+                        loop_budget=policy["correction_loops"],
+                    )
+                break
+
             if (
                 len(interventions) < policy["max_interventions"]
                 and len(corrected["tokens"]) - 1 >= last_intervention_index + policy["cooldown_tokens"]
@@ -3386,6 +3481,8 @@ def run_live_correction_experiment(prompt, base_url, settings, policy, experimen
                     rewrite_pass = len(interventions) + 1
 
                     def harness_progress(payload):
+                        if stop_requested():
+                            return
                         update_status(
                             describe_harness_stage(payload),
                             phase="corrected",
@@ -3416,7 +3513,11 @@ def run_live_correction_experiment(prompt, base_url, settings, policy, experimen
                         policy,
                         progress_cb=harness_progress,
                         progress_context={"run_id": corrected["run_id"]},
+                        stop_event=stop_event,
                     )
+                    if stop_requested():
+                        update_status("Stop requested after claim evidence pass.", phase="stopped", rewrite_pass=rewrite_pass, accepted_rewrites=len(interventions), loop_budget=policy["correction_loops"])
+                        break
                     last_harness_claim_key = claim_key
                     progress(
                         "live_experiment_harness",
@@ -3437,6 +3538,8 @@ def run_live_correction_experiment(prompt, base_url, settings, policy, experimen
                     current_object_harness = None
                     if current_harness.get("status") == "ok":
                         def object_progress(payload):
+                            if stop_requested():
+                                return
                             update_status(
                                 describe_object_stage(payload),
                                 phase="object_harness",
@@ -3466,7 +3569,11 @@ def run_live_correction_experiment(prompt, base_url, settings, policy, experimen
                             policy,
                             progress_cb=object_progress,
                             progress_context={"run_id": corrected["run_id"]},
+                            stop_event=stop_event,
                         )
+                        if stop_requested():
+                            update_status("Stop requested after object evidence pass.", phase="stopped", rewrite_pass=rewrite_pass, accepted_rewrites=len(interventions), loop_budget=policy["correction_loops"])
+                            break
                         progress(
                             "live_experiment_object",
                             {
@@ -3509,6 +3616,8 @@ def run_live_correction_experiment(prompt, base_url, settings, policy, experimen
                         topn = target.get("topN") or []
                         limit = min(len(topn), policy["branch_candidates"] + 1)
                         for alt_rank in range(1, limit):
+                            if stop_requested():
+                                break
                             alt_text = str((topn[alt_rank] or {}).get("token_text") or "")
                             if not alt_text.strip() or not any(ch.isalnum() for ch in alt_text):
                                 continue
@@ -3535,7 +3644,7 @@ def run_live_correction_experiment(prompt, base_url, settings, policy, experimen
                                     "loop_budget": policy["correction_loops"],
                                 },
                             )
-                            result = run_candidate_branch(corrected, rollback_index, alt_rank, policy["branch_lookahead"])
+                            result = run_candidate_branch(corrected, rollback_index, alt_rank, policy["branch_lookahead"], stop_event=stop_event)
                             if result is not None:
                                 candidate_results.append(result)
                                 progress(
@@ -3552,6 +3661,9 @@ def run_live_correction_experiment(prompt, base_url, settings, policy, experimen
                                         "loop_budget": policy["correction_loops"],
                                     },
                                 )
+
+                        if stop_requested():
+                            break
 
                         update_status(
                             "Generating a conservative policy rewrite candidate.",
@@ -3590,7 +3702,11 @@ def run_live_correction_experiment(prompt, base_url, settings, policy, experimen
                                     "loop_budget": policy["correction_loops"],
                                 },
                             ),
+                            stop_event=stop_event,
                         )
+                        if stop_requested():
+                            update_status("Stop requested during rewrite candidate decode.", phase="stopped", rewrite_pass=rewrite_pass, accepted_rewrites=len(interventions), loop_budget=policy["correction_loops"])
+                            break
                         candidate_results.append(rewrite_candidate)
                         progress(
                             "live_experiment_candidate",
@@ -3654,7 +3770,11 @@ def run_live_correction_experiment(prompt, base_url, settings, policy, experimen
                                         "loop_budget": policy["correction_loops"],
                                     },
                                 ),
+                                stop_event=stop_event,
                             )
+                            if stop_requested():
+                                update_status("Stop requested during whole-answer rewrite decode.", phase="stopped", rewrite_pass=rewrite_pass, accepted_rewrites=len(interventions), loop_budget=policy["correction_loops"])
+                                break
                             candidate_results.append(global_rewrite_candidate)
                             progress(
                                 "live_experiment_candidate",
@@ -3671,10 +3791,17 @@ def run_live_correction_experiment(prompt, base_url, settings, policy, experimen
                                 },
                             )
 
+                        if stop_requested():
+                            break
+
                         for item in candidate_results:
+                            if stop_requested():
+                                break
                             focus_index = item.get("window_start", rollback_index)
 
                             def candidate_harness_progress(payload, item=item):
+                                if stop_requested():
+                                    return
                                 update_status(
                                     describe_harness_stage(payload),
                                     phase="candidate_harness",
@@ -3706,8 +3833,11 @@ def run_live_correction_experiment(prompt, base_url, settings, policy, experimen
                                 policy,
                                 progress_cb=candidate_harness_progress,
                                 progress_context={"run_id": item["run"]["run_id"]},
+                                stop_event=stop_event,
                             )
                             def candidate_object_progress(payload, item=item):
+                                if stop_requested():
+                                    return
                                 update_status(
                                     describe_object_stage(payload),
                                     phase="candidate_object",
@@ -3738,7 +3868,12 @@ def run_live_correction_experiment(prompt, base_url, settings, policy, experimen
                                 policy,
                                 progress_cb=candidate_object_progress,
                                 progress_context={"run_id": item["run"]["run_id"]},
+                                stop_event=stop_event,
                             )
+
+                        if stop_requested():
+                            update_status("Stop requested during candidate evidence checks.", phase="stopped", rewrite_pass=rewrite_pass, accepted_rewrites=len(interventions), loop_budget=policy["correction_loops"])
+                            break
 
                         ranked_candidates = []
                         for item in candidate_results:
@@ -3992,12 +4127,8 @@ def run_live_correction_experiment(prompt, base_url, settings, policy, experimen
                                 loop_budget=policy["correction_loops"],
                             )
 
-            if stop_info.get("hard_stop"):
-                break
-            if stop_info.get("stop") and remaining <= 0:
-                break
-
-        finalize_completed_run(corrected, started, status="complete")
+        stopped = stop_requested()
+        finalize_completed_run(corrected, started, status="stopped" if stopped else "complete")
         corrected.setdefault("meta", {}).setdefault("live_experiment", {})
         corrected["meta"]["live_experiment"]["had_intervention"] = bool(interventions)
         corrected["meta"]["live_experiment"]["comparison_role"] = "corrected" if interventions else "replay_sample"
@@ -4005,7 +4136,54 @@ def run_live_correction_experiment(prompt, base_url, settings, policy, experimen
             corrected["meta"]["label"] = "Replay"
         corrected.setdefault("analysis", {})["interventions"] = copy.deepcopy(interventions)
 
+        if stopped:
+            baseline_harness = {"status": "stopped"}
+            corrected_harness = {"status": "stopped"}
+            baseline_object_harness = {"status": "stopped"}
+            corrected_object_harness = {"status": "stopped"}
+            update_status("Experiment stopped by user.", phase="stopped", target="result", rewrite_pass=len(interventions) + 1, accepted_rewrites=len(interventions), loop_budget=policy["correction_loops"])
+            with RUNS_LOCK:
+                RUNS[baseline["run_id"]] = copy.deepcopy(baseline)
+                RUNS[corrected["run_id"]] = copy.deepcopy(corrected)
+                if baseline["run_id"] not in RUN_ORDER:
+                    RUN_ORDER.append(baseline["run_id"])
+                if corrected["run_id"] not in RUN_ORDER:
+                    RUN_ORDER.append(corrected["run_id"])
+            return {
+                "status": "stopped",
+                "mode": "hybrid_correction_loop",
+                "baseline_run_id": baseline["run_id"],
+                "corrected_run_id": corrected["run_id"],
+                "baseline": baseline,
+                "corrected": corrected,
+                "interventions": interventions,
+                "harness": {
+                    "baseline": baseline_harness,
+                    "corrected": corrected_harness,
+                },
+                "object_harness": {
+                    "baseline": baseline_object_harness,
+                    "corrected": corrected_object_harness,
+                },
+                "policy": policy,
+                "metrics": {
+                    "baseline_max_risk": baseline.get("summary", {}).get("decoder_risk_max"),
+                    "corrected_max_risk": corrected.get("summary", {}).get("decoder_risk_max"),
+                    "baseline_alerts": baseline.get("summary", {}).get("decoder_alert_count"),
+                    "corrected_alerts": corrected.get("summary", {}).get("decoder_alert_count"),
+                    "baseline_claim_risk": None,
+                    "corrected_claim_risk": None,
+                    "baseline_object_risk": None,
+                    "corrected_object_risk": None,
+                    "intervention_count": len(interventions),
+                    "correction_loops": policy["correction_loops"],
+                    "rewrite_passes": len(interventions) + 1,
+                },
+            }
+
         def final_harness_progress(payload, target_name, run_id):
+            if stop_requested():
+                return
             update_status(
                 f"Final {target_name} evidence pass. {describe_harness_stage(payload)}",
                 phase="finalize",
@@ -4034,7 +4212,46 @@ def run_live_correction_experiment(prompt, base_url, settings, policy, experimen
             policy,
             progress_cb=lambda payload: final_harness_progress(payload, "baseline", baseline["run_id"]),
             progress_context={"run_id": baseline["run_id"]},
+            stop_event=stop_event,
         )
+        if stop_requested():
+            baseline_harness = {"status": "stopped"}
+            corrected_harness = {"status": "stopped"}
+            baseline_object_harness = {"status": "stopped"}
+            corrected_object_harness = {"status": "stopped"}
+            update_status("Experiment stopped during final evidence pass.", phase="stopped", target="result", rewrite_pass=len(interventions) + 1, accepted_rewrites=len(interventions), loop_budget=policy["correction_loops"])
+            with RUNS_LOCK:
+                RUNS[baseline["run_id"]] = copy.deepcopy(baseline)
+                RUNS[corrected["run_id"]] = copy.deepcopy(corrected)
+                if baseline["run_id"] not in RUN_ORDER:
+                    RUN_ORDER.append(baseline["run_id"])
+                if corrected["run_id"] not in RUN_ORDER:
+                    RUN_ORDER.append(corrected["run_id"])
+            return {
+                "status": "stopped",
+                "mode": "hybrid_correction_loop",
+                "baseline_run_id": baseline["run_id"],
+                "corrected_run_id": corrected["run_id"],
+                "baseline": baseline,
+                "corrected": corrected,
+                "interventions": interventions,
+                "harness": {"baseline": baseline_harness, "corrected": corrected_harness},
+                "object_harness": {"baseline": baseline_object_harness, "corrected": corrected_object_harness},
+                "policy": policy,
+                "metrics": {
+                    "baseline_max_risk": baseline.get("summary", {}).get("decoder_risk_max"),
+                    "corrected_max_risk": corrected.get("summary", {}).get("decoder_risk_max"),
+                    "baseline_alerts": baseline.get("summary", {}).get("decoder_alert_count"),
+                    "corrected_alerts": corrected.get("summary", {}).get("decoder_alert_count"),
+                    "baseline_claim_risk": None,
+                    "corrected_claim_risk": None,
+                    "baseline_object_risk": None,
+                    "corrected_object_risk": None,
+                    "intervention_count": len(interventions),
+                    "correction_loops": policy["correction_loops"],
+                    "rewrite_passes": len(interventions) + 1,
+                },
+            }
         update_status("Running final corrected evidence pass.", phase="finalize", target="corrected")
         corrected_harness = run_claim_harness(
             corrected,
@@ -4042,11 +4259,14 @@ def run_live_correction_experiment(prompt, base_url, settings, policy, experimen
             policy,
             progress_cb=lambda payload: final_harness_progress(payload, "corrected", corrected["run_id"]),
             progress_context={"run_id": corrected["run_id"]},
+            stop_event=stop_event,
         )
         baseline.setdefault("analysis", {})["focus_claim"] = copy.deepcopy(baseline_harness)
         corrected.setdefault("analysis", {})["focus_claim"] = copy.deepcopy(corrected_harness)
 
         def final_object_progress(payload, target_name, run_id):
+            if stop_requested():
+                return
             update_status(
                 f"Final {target_name} object pass. {describe_object_stage(payload)}",
                 phase="finalize",
@@ -4074,6 +4294,7 @@ def run_live_correction_experiment(prompt, base_url, settings, policy, experimen
             policy,
             progress_cb=lambda payload: final_object_progress(payload, "baseline", baseline["run_id"]),
             progress_context={"run_id": baseline["run_id"]},
+            stop_event=stop_event,
         )
         update_status("Running final corrected object evidence pass.", phase="finalize", target="corrected_object")
         corrected_object_harness = run_object_harness(
@@ -4081,6 +4302,7 @@ def run_live_correction_experiment(prompt, base_url, settings, policy, experimen
             policy,
             progress_cb=lambda payload: final_object_progress(payload, "corrected", corrected["run_id"]),
             progress_context={"run_id": corrected["run_id"]},
+            stop_event=stop_event,
         )
         baseline.setdefault("analysis", {})["focus_object"] = copy.deepcopy(baseline_object_harness)
         corrected.setdefault("analysis", {})["focus_object"] = copy.deepcopy(corrected_object_harness)
@@ -4095,6 +4317,7 @@ def run_live_correction_experiment(prompt, base_url, settings, policy, experimen
 
         update_status("Packaging final experiment result.", phase="finalize", target="result")
         return {
+            "status": "stopped" if stop_requested() else "complete",
             "mode": "hybrid_correction_loop",
             "baseline_run_id": baseline["run_id"],
             "corrected_run_id": corrected["run_id"],
@@ -4178,8 +4401,10 @@ class TelemetryHandler(SimpleHTTPRequestHandler):
 
         if path == "/api/status":
             with GEN_LOCK:
-                running = bool(GEN_THREAD and GEN_THREAD.is_alive())
+                live_running = bool(LIVE_STOP is not None and not LIVE_STOP.is_set())
+                running = bool(GEN_THREAD and GEN_THREAD.is_alive()) or live_running
                 active_run_id = GEN_RUN_ID
+                active_experiment_id = LIVE_EXPERIMENT_ID
             backend_probe = get_cached_backend_probe(DEFAULTS.get("base_url"))
             if backend_probe is None:
                 backend_probe = empty_backend_probe(DEFAULTS.get("base_url"), probe_state="idle")
@@ -4189,6 +4414,7 @@ class TelemetryHandler(SimpleHTTPRequestHandler):
                 {
                     "running": running,
                     "active_run_id": active_run_id,
+                    "active_experiment_id": active_experiment_id,
                     "defaults": copy.deepcopy(DEFAULTS),
                     "backend_probe": backend_probe,
                 },
@@ -4237,6 +4463,7 @@ class TelemetryHandler(SimpleHTTPRequestHandler):
             return
 
         if path == "/api/live-experiment":
+            global LIVE_STOP, LIVE_EXPERIMENT_ID
             prompt = (body.get("prompt") or "").strip()
             raw_base_url = body.get("base_url") or DEFAULTS["base_url"]
             experiment_id = body.get("experiment_id")
@@ -4252,11 +4479,20 @@ class TelemetryHandler(SimpleHTTPRequestHandler):
             settings = sanitize_settings(body.get("settings"))
             settings["chunk_size"] = 1
             policy = sanitize_live_policy(body.get("policy"))
+            stop_event = threading.Event()
+            with GEN_LOCK:
+                LIVE_STOP = stop_event
+                LIVE_EXPERIMENT_ID = experiment_id
             try:
-                result = run_live_correction_experiment(prompt, base_url, settings, policy, experiment_id=experiment_id)
+                result = run_live_correction_experiment(prompt, base_url, settings, policy, experiment_id=experiment_id, stop_event=stop_event)
             except Exception as err:
                 send_json(self, 500, {"error": f"live experiment failed: {err}"})
                 return
+            finally:
+                with GEN_LOCK:
+                    if LIVE_STOP is stop_event:
+                        LIVE_STOP = None
+                        LIVE_EXPERIMENT_ID = None
 
             broadcast_event({"type": "run_imported", "run": copy.deepcopy(result["baseline"])})
             broadcast_event({"type": "run_imported", "run": copy.deepcopy(result["corrected"])})

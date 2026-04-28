@@ -13,6 +13,7 @@ const ui = {
   branchLookahead: document.getElementById('branch-lookahead-input'),
   maxInterventions: document.getElementById('max-interventions-input'),
   runBtn: document.getElementById('run-btn'),
+  stopBtn: document.getElementById('stop-btn'),
   probeBackendBtn: document.getElementById('probe-backend-btn'),
   status: document.getElementById('status-badge'),
 
@@ -84,6 +85,7 @@ const state = {
     passes: [],
     finalEvidence: null,
   },
+  experimentRunning: false,
   loopBudget: 0,
   hoverToken: null,
 };
@@ -139,6 +141,13 @@ function setStatus(text, tone = 'neutral') {
   ui.status.style.color = '#415468';
   ui.status.style.background = '#eef4fb';
   ui.status.style.borderColor = '#bfd0de';
+}
+
+function setExperimentRunning(running, { stopping = false } = {}) {
+  state.experimentRunning = Boolean(running);
+  ui.runBtn.disabled = Boolean(running);
+  ui.stopBtn.disabled = !running || stopping;
+  ui.stopBtn.textContent = stopping ? 'Stopping...' : 'Stop';
 }
 
 async function apiPost(path, payload) {
@@ -587,6 +596,10 @@ function updateTraceFromStatus(payload = {}) {
   if (payload.message) {
     pass.currentStage = payload.message;
     appendTraceEvent(pass, payload.message);
+    if (payload.phase === 'stopped') {
+      pass.status = 'stopped';
+      pass.outcome = payload.message;
+    }
     if (payload.message.includes('No candidate cleared')) {
       pass.outcome = 'No candidate cleared the acceptance gates; replay continued.';
       pass.status = 'running';
@@ -757,6 +770,7 @@ function appendFinalTraceEvent(final, line) {
 }
 
 function finalizeIterationTrace(result = {}) {
+  const stopped = result?.status === 'stopped' || result?.corrected?.meta?.status === 'stopped';
   const interventionCount = Number(result?.metrics?.intervention_count ?? 0);
   const rewritePasses = Math.max(1, Number(result?.metrics?.rewrite_passes ?? interventionCount + 1));
   state.loopBudget = asNumber(result?.metrics?.correction_loops, state.loopBudget) ?? state.loopBudget;
@@ -807,6 +821,10 @@ function finalizeIterationTrace(result = {}) {
     const pass = ensureTracePass(passNumber);
     if (passNumber <= interventionCount) {
       pass.status = 'accepted';
+    } else if (stopped && passNumber === rewritePasses) {
+      pass.status = 'stopped';
+      pass.outcome = pass.outcome || 'Experiment stopped before this trajectory completed.';
+      pass.currentStage = pass.outcome;
     } else {
       pass.status = 'complete';
       if (!pass.outcome) {
@@ -818,9 +836,15 @@ function finalizeIterationTrace(result = {}) {
     }
   }
   const final = ensureFinalEvidenceTrace();
-  final.status = 'complete';
-  final.currentStage = 'Final baseline/corrected evidence passes completed.';
-  appendFinalTraceEvent(final, 'Final claim and object evidence are available in the evidence panels.');
+  if (stopped) {
+    final.status = 'skipped';
+    final.currentStage = 'Final evidence passes were skipped because the experiment was stopped.';
+    appendFinalTraceEvent(final, 'Stopped before final claim/object evidence could be collected.');
+  } else {
+    final.status = 'complete';
+    final.currentStage = 'Final baseline/corrected evidence passes completed.';
+    appendFinalTraceEvent(final, 'Final claim and object evidence are available in the evidence panels.');
+  }
   renderIterationTrace();
 }
 
@@ -1468,7 +1492,8 @@ function connectStream() {
     if (payload.type === 'live_experiment_completed') {
       renderResult(payload);
       finalizeIterationTrace(payload);
-      setStatus('Experiment completed.', 'success');
+      setExperimentRunning(false);
+      setStatus(payload.status === 'stopped' ? 'Experiment stopped.' : 'Experiment completed.', payload.status === 'stopped' ? 'neutral' : 'success');
     }
   };
 
@@ -1484,13 +1509,18 @@ function renderResult(result) {
   const baseline = result?.baseline;
   const corrected = result?.corrected;
   const interventionCount = Number(result?.metrics?.intervention_count ?? 0);
-  const correctedLabel = interventionCount > 0 ? 'Corrected Candidate' : 'Replay Sample';
+  const stopped = result?.status === 'stopped' || corrected?.meta?.status === 'stopped';
+  const correctedLabel = stopped ? 'Stopped Sample' : interventionCount > 0 ? 'Corrected Candidate' : 'Replay Sample';
   ui.correctedTitle.textContent = correctedLabel;
 
   if (!state.passLog.length) {
     state.passLog = ['Pass 1 started from the raw replay path.'];
   }
-  if (interventionCount > 0) {
+  if (stopped) {
+    state.passLog = state.passLog.length
+      ? state.passLog
+      : ['Experiment stopped before the live correction loop completed.'];
+  } else if (interventionCount > 0) {
     const fromResult = (result?.interventions || []).map((item, idx) =>
       `Pass ${idx + 1}: accepted ${String(item.chosen_strategy || 'candidate').replace(/_/g, ' ')} at token ${item.trigger_index}; pass ${idx + 2} starts from that trajectory. `
       + `Decoder ${formatPercent(item.baseline_avg_risk, 0)} -> ${formatPercent(item.chosen_avg_risk, 0)} | `
@@ -1513,7 +1543,11 @@ function renderResult(result) {
   ui.experimentMeta.textContent =
     `Mode=${result?.mode || '-'} | correction_loops=${result?.metrics?.correction_loops ?? 0} | `
     + `accepted_rewrites=${result?.metrics?.intervention_count ?? 0} | baseline=${result?.baseline_run_id || '-'} | corrected=${result?.corrected_run_id || '-'}`;
-  if (interventionCount > 0) {
+  if (stopped) {
+    ui.experimentSummary.textContent =
+      `Experiment stopped by user. Baseline tokens ${baseline?.summary?.token_count ?? '-'}; compared sample tokens ${corrected?.summary?.token_count ?? '-'}. `
+      + `Final claim/object evidence passes were skipped, so this result is a partial trace, not a completed comparison.`;
+  } else if (interventionCount > 0) {
     ui.experimentSummary.textContent =
       `Baseline max risk ${formatPercent(result?.metrics?.baseline_max_risk, 0)} vs corrected ${formatPercent(result?.metrics?.corrected_max_risk, 0)}. `
       + `Claim risk: ${formatPercent(result?.metrics?.baseline_claim_risk, 0)} -> ${formatPercent(result?.metrics?.corrected_claim_risk, 0)}. `
@@ -1577,6 +1611,19 @@ async function probeBackend() {
   }
 }
 
+async function stopExperiment() {
+  if (!state.experimentRunning && !state.currentExperimentId) return;
+  try {
+    setExperimentRunning(true, { stopping: true });
+    setStatus('Stop requested...', 'neutral');
+    await apiPost('/api/stop', { experiment_id: state.currentExperimentId });
+    setStatus('Stopping after the current backend call returns...', 'neutral');
+  } catch (err) {
+    setExperimentRunning(state.experimentRunning);
+    setStatus(`Stop failed: ${err.message}`, 'error');
+  }
+}
+
 async function runExperiment() {
   const prompt = ui.prompt.value.trim();
   const baseUrl = normalizeBaseUrl(ui.endpoint.value);
@@ -1614,6 +1661,7 @@ async function runExperiment() {
   try {
     state.currentExperimentId = `exp_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`;
     resetExperimentView();
+    setExperimentRunning(true);
     setStatus('Running baseline and replay/rewrite loops...', 'neutral');
     const result = await apiPost('/api/live-experiment', {
       experiment_id: state.currentExperimentId,
@@ -1624,9 +1672,11 @@ async function runExperiment() {
     });
     renderResult(result);
     finalizeIterationTrace(result);
-    setStatus('Experiment completed.', 'success');
+    setStatus(result?.status === 'stopped' ? 'Experiment stopped.' : 'Experiment completed.', result?.status === 'stopped' ? 'neutral' : 'success');
   } catch (err) {
     setStatus(`Experiment failed: ${err.message}`, 'error');
+  } finally {
+    setExperimentRunning(false);
   }
 }
 
@@ -1636,6 +1686,7 @@ async function bootstrap() {
   if (status?.defaults?.vector_mode) ui.vectorMode.value = String(status.defaults.vector_mode);
 
   ui.runBtn.addEventListener('click', runExperiment);
+  ui.stopBtn.addEventListener('click', stopExperiment);
   ui.probeBackendBtn.addEventListener('click', probeBackend);
   ui.endpoint.addEventListener('blur', () => {
     const normalized = normalizeBaseUrl(ui.endpoint.value);
