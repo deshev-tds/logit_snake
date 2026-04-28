@@ -1,6 +1,8 @@
-# LLM Snake Scope (2D)
+# logit_snake
 
-A local analyst-focused visualizer for autoregressive runs.
+LLM token visualizer for decoder risk, logprobs, embeddings, branching, and consistency checks.
+
+This is a local analyst-focused visualizer for autoregressive runs.
 
 This version is intentionally **2D + time-first**:
 - stable PCA projection of token vectors
@@ -442,3 +444,7 @@ These are still decoder-side heuristics, not claim-level factuality checks.
 - Multi-sample semantic uncertainty as a secondary checker rather than single-pass entropy only.
 - White-box telemetry capture for cross-layer / hidden-state analysis when the backend allows it.
 - Detector calibration and OOD evaluation against human-aligned factuality labels.
+
+---
+
+Maintained by [Damyan Deshev](https://github.com/damyan-deshev) - local-first software, deterministic data paths, retrieval, evaluation, and practical product systems.
