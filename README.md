@@ -100,6 +100,10 @@ This capture shows the optional 3D orbit projection for the same run family.
 
 An experimental second page is now available at `./live.html`.
 
+The page now has two separate laboratory modes.
+
+### Hybrid Replay / Rewrite
+
 What it does:
 - runs a baseline decode and a corrected decode with the same prompt/settings
 - watches decoder-risk token-by-token
@@ -114,6 +118,27 @@ Current limitation:
 - lower decoder risk after branching is useful evidence, but it is not proof of factual correctness
 - the current claim harness is still black-box and slow; on a realistic fake-reference workload it adds minutes, not milliseconds
 - if no intervention fires, the second run should be read as a matched replay sample rather than as evidence of successful correction
+
+### Internal Consistency Retraction
+
+This newer mode is answer-level rather than token-branching. It does not try to prove factual truth. It tests whether a model can obey a visible internal-consistency retraction contract:
+
+- generate a normal draft answer without forcing one-token decode
+- extract check-worthy commitments from the draft while separating `model_draft`, `user_prompt`, and `user_quoted_material` origins
+- run internal-only probe samples for selected model-draft commitments
+- score those probe observations deterministically as agreement, contradiction, empty/unknown, or mixed
+- feed the deterministic recommendation back into a reconciliation pass
+- verify that the final answer actually obeys the contract instead of merely sounding cautious
+
+The decision labels are deliberately modest:
+
+- `internally_stable_keep`
+- `uncertain_abstain`
+- `unsupported_retract`
+
+The evidence basis for this mode is always `internal_probe_consistency`. It is not web evidence, retrieval evidence, or human verification. A successful result means `contract_satisfied`: the final answer passed deterministic behavioral verification for the internal-consistency retraction contract. It does not mean the answer is factually proven.
+
+The UI renders each verifier-loop step as a first-class research trace: draft, commitments, raw probe observations, deterministic scoring, reconciliation decisions, final answer, verifier checks, provenance, and budget/stop state.
 
 The repeatable evaluation plan for this page lives in [docs/LIVE_BRANCH_EVAL.md](docs/LIVE_BRANCH_EVAL.md).
 

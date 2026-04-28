@@ -99,7 +99,7 @@ body {
 
 #generation-grid {
   display: grid;
-  grid-template-columns: 1.5fr 2.2fr repeat(5, minmax(0, 0.85fr));
+  grid-template-columns: minmax(180px, 1.1fr) minmax(180px, 1.1fr) minmax(280px, 2.2fr) repeat(4, minmax(92px, 0.75fr));
   gap: 10px;
   align-items: start;
 }
@@ -693,6 +693,107 @@ kbd {
   border-left: 2px solid #d8e4ef;
 }
 
+.hidden {
+  display: none !important;
+}
+
+.retraction-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.retraction-step {
+  border: 1px solid #d3e0ec;
+  border-left: 4px solid #7faebe;
+  border-radius: 8px;
+  padding: 9px;
+  background: #ffffff;
+  min-width: 0;
+}
+
+.retraction-step h4 {
+  margin: 0 0 7px;
+  font-family: 'IBM Plex Mono', ui-monospace, monospace;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #31465b;
+}
+
+.trace-list {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.trace-card {
+  border: 1px solid #d9e5f1;
+  border-radius: 8px;
+  padding: 7px 8px;
+  background: #fbfdff;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;
+}
+
+.trace-card.pass {
+  border-color: #badfc7;
+  background: #f7fdf9;
+}
+
+.trace-card.fail {
+  border-color: #efb4ae;
+  background: #fff8f7;
+}
+
+.trace-card.warn {
+  border-color: #efd0a6;
+  background: #fffaf3;
+}
+
+.trace-card-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  align-items: baseline;
+  font-family: 'IBM Plex Mono', ui-monospace, monospace;
+  font-size: 11px;
+}
+
+.trace-card-title {
+  color: var(--text);
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.trace-card-pill {
+  border: 1px solid #cad8e6;
+  border-radius: 999px;
+  padding: 1px 6px;
+  background: #f3f8fd;
+  color: var(--muted);
+  white-space: nowrap;
+  text-transform: uppercase;
+  font-size: 10px;
+}
+
+.trace-card-body {
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.trace-card-detail {
+  font-family: 'IBM Plex Mono', ui-monospace, monospace;
+  font-size: 11px;
+  color: #42566a;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .tokenized-output {
   cursor: default;
 }
@@ -994,7 +1095,8 @@ kbd {
   }
 
   .result-grid,
-  .harness-grid {
+  .harness-grid,
+  .retraction-grid {
     grid-template-columns: 1fr;
   }
 

@@ -16,11 +16,17 @@
     <header id="topbar" class="panel">
       <div class="title-wrap">
         <h1>Live Branch Lab</h1>
-        <p>Experimental decoder-risk intervention: detect instability, replay from a safer prefix, and compare against baseline.</p>
+        <p>Experimental decoder-risk intervention and internal-consistency retraction workflows for hallucination research.</p>
       </div>
       <div id="generation-grid">
         <label>Endpoint
           <input id="endpoint-input" type="text" value="http://127.0.0.1:8080" />
+        </label>
+        <label>Lab Mode
+          <select id="lab-mode-select">
+            <option value="hybrid" selected>Hybrid Replay / Rewrite</option>
+            <option value="retraction">Internal Consistency Retraction</option>
+          </select>
         </label>
         <label>Prompt
           <textarea id="prompt-input" rows="4" placeholder="Ask for a factual answer or a biography-style answer that may drift into invented detail.">Answer directly. Write 5 factual bullet points about the 2006 monograph "Computational Orchards of the Balkans" by Prof. Elena Mirkova, including publisher, ISBN, and one direct quotation from the book.</textarea>
@@ -68,7 +74,7 @@
         <button id="probe-backend-btn">Probe Backend</button>
         <span id="status-badge">Idle</span>
       </div>
-      <div class="info-note">
+      <div id="mode-info-note" class="info-note">
         This page does not claim to make the model truthful. In the current implementation, intervention uses <strong>prefix replay</strong>, not exact KV-state rewind.
         Because llama.cpp's streaming mode does not expose token-probability telemetry token-by-token, the lab runs one-token decode steps (`n_predict=1`) to observe risk and decide whether to branch.
       </div>
@@ -91,7 +97,7 @@
           <div id="experiment-summary" class="info-note">Run a baseline vs corrected decode to compare decoder-risk trajectory and intervention count.</div>
         </section>
 
-        <section class="subpanel">
+        <section class="subpanel hybrid-only">
           <div class="subpanel-head">
             <h3>Iteration Trace</h3>
             <span id="iteration-trace-summary" class="inline-note">No correction loop has started yet.</span>
@@ -101,7 +107,52 @@
           </div>
         </section>
 
-        <section class="result-grid">
+        <section id="retraction-panel" class="subpanel hidden">
+          <div class="subpanel-head">
+            <h3>Verifier Loop Trace</h3>
+            <span id="retraction-trace-summary" class="inline-note">No retraction experiment has started yet.</span>
+          </div>
+          <div class="retraction-grid">
+            <article class="retraction-step">
+              <h4>Draft Answer</h4>
+              <div id="retraction-draft" class="text-block">No draft yet.</div>
+            </article>
+            <article class="retraction-step">
+              <h4>Commitment Extraction</h4>
+              <div id="retraction-commitments" class="trace-list">No commitments yet.</div>
+            </article>
+            <article class="retraction-step">
+              <h4>Internal Probe Packets</h4>
+              <div id="retraction-probes" class="trace-list">No probe packets yet.</div>
+            </article>
+            <article class="retraction-step">
+              <h4>Deterministic Scoring</h4>
+              <div id="retraction-scoring" class="trace-list">No scoring output yet.</div>
+            </article>
+            <article class="retraction-step">
+              <h4>Reconciliation</h4>
+              <div id="retraction-reconciliation" class="trace-list">No reconciliation pass yet.</div>
+            </article>
+            <article class="retraction-step">
+              <h4>Final Answer</h4>
+              <div id="retraction-final-answer" class="text-block">No final answer yet.</div>
+            </article>
+            <article class="retraction-step">
+              <h4>Verifier Result</h4>
+              <div id="retraction-verifier" class="trace-list">No verifier result yet.</div>
+            </article>
+            <article class="retraction-step">
+              <h4>Provenance</h4>
+              <div id="retraction-provenance" class="trace-list">No provenance yet.</div>
+            </article>
+            <article class="retraction-step">
+              <h4>Budget / Stop State</h4>
+              <div id="retraction-budget" class="trace-list">No budget state yet.</div>
+            </article>
+          </div>
+        </section>
+
+        <section class="result-grid hybrid-only">
           <section class="subpanel">
             <h3>Baseline</h3>
             <div class="kv"><span>Run ID</span><strong id="baseline-run-id">-</strong></div>
@@ -139,13 +190,13 @@
           <div class="kv"><span>Intervention Mode</span><strong id="backend-mode">hybrid replay / rewrite</strong></div>
         </section>
 
-        <section class="subpanel">
+        <section class="subpanel hybrid-only">
           <h3>Interventions</h3>
           <div class="kv"><span>Count</span><strong id="intervention-count">0</strong></div>
           <div id="intervention-list"></div>
         </section>
 
-        <section class="subpanel">
+        <section class="subpanel hybrid-only">
           <h3>Mode & Object Evidence</h3>
           <div class="kv"><span>Current Mode</span><strong id="mode-current">replay</strong></div>
           <div class="kv"><span>Focus Object</span><strong id="mode-focus-object">-</strong></div>
@@ -163,7 +214,7 @@
           <div id="object-evidence" class="text-block">No object-level evidence yet.</div>
         </section>
 
-        <section class="subpanel">
+        <section class="subpanel hybrid-only">
           <h3>Harness Evidence</h3>
           <div id="harness-summary" class="info-note">No claim-level harness evidence yet.</div>
 

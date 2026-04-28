@@ -1,5 +1,6 @@
 const ui = {
   endpoint: document.getElementById('endpoint-input'),
+  labMode: document.getElementById('lab-mode-select'),
   prompt: document.getElementById('prompt-input'),
   seed: document.getElementById('seed-input'),
   temperature: document.getElementById('temperature-input'),
@@ -22,6 +23,18 @@ const ui = {
   iterationTraceSummary: document.getElementById('iteration-trace-summary'),
   iterationTrace: document.getElementById('iteration-trace'),
   openMainLink: document.getElementById('open-main-link'),
+  modeInfoNote: document.getElementById('mode-info-note'),
+  retractionPanel: document.getElementById('retraction-panel'),
+  retractionTraceSummary: document.getElementById('retraction-trace-summary'),
+  retractionDraft: document.getElementById('retraction-draft'),
+  retractionCommitments: document.getElementById('retraction-commitments'),
+  retractionProbes: document.getElementById('retraction-probes'),
+  retractionScoring: document.getElementById('retraction-scoring'),
+  retractionReconciliation: document.getElementById('retraction-reconciliation'),
+  retractionFinalAnswer: document.getElementById('retraction-final-answer'),
+  retractionVerifier: document.getElementById('retraction-verifier'),
+  retractionProvenance: document.getElementById('retraction-provenance'),
+  retractionBudget: document.getElementById('retraction-budget'),
 
   baselineRunId: document.getElementById('baseline-run-id'),
   baselineRisk: document.getElementById('baseline-risk'),
@@ -84,6 +97,17 @@ const state = {
   iterationTrace: {
     passes: [],
     finalEvidence: null,
+  },
+  retractionTrace: {
+    draft: null,
+    commitments: [],
+    probePackets: [],
+    probeEvents: [],
+    reconciliationPasses: [],
+    verifierTrace: [],
+    provenance: null,
+    metrics: null,
+    status: null,
   },
   experimentRunning: false,
   loopBudget: 0,
@@ -148,6 +172,236 @@ function setExperimentRunning(running, { stopping = false } = {}) {
   ui.runBtn.disabled = Boolean(running);
   ui.stopBtn.disabled = !running || stopping;
   ui.stopBtn.textContent = stopping ? 'Stopping...' : 'Stop';
+}
+
+function currentLabMode() {
+  return ui.labMode?.value === 'retraction' ? 'retraction' : 'hybrid';
+}
+
+function setLabModeVisibility() {
+  const retraction = currentLabMode() === 'retraction';
+  document.querySelectorAll('.hybrid-only').forEach((node) => node.classList.toggle('hidden', retraction));
+  ui.retractionPanel?.classList.toggle('hidden', !retraction);
+  if (ui.openMainLink) ui.openMainLink.classList.toggle('hidden', retraction);
+  if (ui.modeInfoNote) {
+    ui.modeInfoNote.innerHTML = retraction
+      ? 'Internal consistency retraction mode does <strong>not</strong> prove factual truth. It shows whether the model can obey a deterministic behavioral contract built from internal probe consistency.'
+      : 'This page does not claim to make the model truthful. In the current implementation, intervention uses <strong>prefix replay</strong>, not exact KV-state rewind. Because llama.cpp streaming mode does not expose token-probability telemetry token-by-token, the lab runs one-token decode steps (`n_predict=1`) to observe risk and decide whether to branch.';
+  }
+  if (ui.backendMode) {
+    ui.backendMode.textContent = retraction ? 'internal consistency retraction' : 'hybrid replay / rewrite';
+  }
+}
+
+function resetRetractionTrace() {
+  state.retractionTrace = {
+    draft: null,
+    commitments: [],
+    probePackets: [],
+    probeEvents: [],
+    reconciliationPasses: [],
+    verifierTrace: [],
+    provenance: null,
+    metrics: null,
+    status: null,
+  };
+}
+
+function clearNode(node, emptyText = '') {
+  if (!node) return;
+  node.innerHTML = '';
+  if (emptyText) node.textContent = emptyText;
+}
+
+function appendTraceCard(parent, { title = '', pill = '', body = '', detail = '', tone = '' } = {}) {
+  if (!parent) return null;
+  const card = document.createElement('div');
+  card.className = `trace-card ${tone || ''}`.trim();
+  const head = document.createElement('div');
+  head.className = 'trace-card-head';
+  const titleNode = document.createElement('span');
+  titleNode.className = 'trace-card-title';
+  titleNode.textContent = title || '-';
+  const pillNode = document.createElement('span');
+  pillNode.className = 'trace-card-pill';
+  pillNode.textContent = pill || '-';
+  head.append(titleNode, pillNode);
+  card.appendChild(head);
+  if (body) {
+    const bodyNode = document.createElement('div');
+    bodyNode.className = 'trace-card-body';
+    bodyNode.textContent = body;
+    card.appendChild(bodyNode);
+  }
+  if (detail) {
+    const detailNode = document.createElement('div');
+    detailNode.className = 'trace-card-detail';
+    detailNode.textContent = detail;
+    card.appendChild(detailNode);
+  }
+  parent.appendChild(card);
+  return card;
+}
+
+function shortJson(value) {
+  if (value == null) return '';
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
+}
+
+function renderRetractionBudget(metrics = state.retractionTrace.metrics) {
+  if (!ui.retractionBudget) return;
+  ui.retractionBudget.innerHTML = '';
+  if (!metrics) {
+    ui.retractionBudget.textContent = 'No budget state yet.';
+    return;
+  }
+  const phases = metrics.phase_durations_ms || {};
+  appendTraceCard(ui.retractionBudget, {
+    title: 'Budget',
+    pill: metrics.budget_exhausted ? 'exhausted' : 'active',
+    tone: metrics.budget_exhausted ? 'fail' : 'pass',
+    body: `model calls ${metrics.model_calls ?? 0} | elapsed ${metrics.duration_ms ?? 0}ms`,
+    detail: [
+      metrics.budget_exhausted_phase ? `budget_exhausted_phase: ${metrics.budget_exhausted_phase}` : '',
+      metrics.stopped_phase ? `stopped_phase: ${metrics.stopped_phase}` : '',
+      Object.keys(phases).length ? `phase_durations_ms:\n${shortJson(phases)}` : '',
+    ].filter(Boolean).join('\n'),
+  });
+}
+
+function renderRetractionProvenance(provenance = state.retractionTrace.provenance) {
+  if (!ui.retractionProvenance) return;
+  ui.retractionProvenance.innerHTML = '';
+  if (!provenance) {
+    ui.retractionProvenance.textContent = 'No provenance yet.';
+    return;
+  }
+  appendTraceCard(ui.retractionProvenance, {
+    title: 'Models and versions',
+    pill: provenance.policy_version || 'policy',
+    body: `draft=${provenance.draft_model || '-'} | probe=${provenance.probe_model || '-'} | reconciliation=${provenance.reconciliation_model || '-'}`,
+    detail: `scorer=${provenance.scorer_version || '-'}\nverifier=${provenance.verifier_version || '-'}\nbackend_hash=${provenance.backend_base_url_hash || '-'}`,
+  });
+}
+
+function renderRetractionCommitments(commitments = state.retractionTrace.commitments) {
+  if (!ui.retractionCommitments) return;
+  ui.retractionCommitments.innerHTML = '';
+  if (!commitments?.length) {
+    ui.retractionCommitments.textContent = 'No commitments yet.';
+    return;
+  }
+  commitments.forEach((item) => {
+    const specifics = (item.protected_specifics || []).map((spec) => `${spec.kind}:${spec.text}`).join(', ') || 'none';
+    appendTraceCard(ui.retractionCommitments, {
+      title: item.id || 'commitment',
+      pill: item.origin || '-',
+      tone: item.selected_for_probe ? 'warn' : '',
+      body: item.text || '',
+      detail: [
+        `kind: ${item.kind || '-'}`,
+        `span: ${item.source_span?.start ?? '-'}..${item.source_span?.end ?? '-'}`,
+        `centrality: ${formatPercent(item.centrality, 0)}`,
+        `in_scope: ${item.in_retraction_scope ? 'yes' : 'no'}`,
+        `selected_for_probe: ${item.selected_for_probe ? 'yes' : 'no'}`,
+        `protected_specifics: ${specifics}`,
+        `risk_reasons: ${(item.risk_reasons || []).join(', ') || 'none'}`,
+      ].join('\n'),
+    });
+  });
+}
+
+function renderRetractionProbePackets(packets = state.retractionTrace.probePackets) {
+  if (!ui.retractionProbes || !ui.retractionScoring) return;
+  ui.retractionProbes.innerHTML = '';
+  ui.retractionScoring.innerHTML = '';
+  if (!packets?.length) {
+    ui.retractionProbes.textContent = 'No probe packets yet.';
+    ui.retractionScoring.textContent = 'No scoring output yet.';
+    return;
+  }
+  packets.forEach((packet) => {
+    appendTraceCard(ui.retractionScoring, {
+      title: packet.commitment_id || 'packet',
+      pill: packet.deterministic_recommendation || '-',
+      tone: packet.deterministic_recommendation === 'retract' ? 'fail' : packet.deterministic_recommendation === 'keep_with_caveat' ? 'pass' : 'warn',
+      body: `label=${packet.consistency_label || '-'} | agreement=${formatPercent(packet.agreement_score, 0)} | contradiction=${formatPercent(packet.contradiction_score, 0)} | empty=${formatPercent(packet.emptiness_score, 0)}`,
+      detail: shortJson(packet.scoring_debug || {}),
+    });
+    (packet.probe_observations || []).forEach((obs) => {
+      appendTraceCard(ui.retractionProbes, {
+        title: `${packet.commitment_id || 'packet'} sample ${obs.sample_index ?? '-'}`,
+        pill: obs.normalized_label || '-',
+        tone: obs.normalized_label === 'agreement' ? 'pass' : obs.normalized_label === 'contradiction' ? 'fail' : 'warn',
+        body: obs.normalized_answer || '',
+        detail: [
+          obs.parse_error ? 'parse_error: yes' : 'parse_error: no',
+          obs.raw_answer ? `raw:\n${obs.raw_answer}` : '',
+        ].filter(Boolean).join('\n'),
+      });
+    });
+  });
+}
+
+function renderRetractionReconciliation(passes = state.retractionTrace.reconciliationPasses) {
+  if (!ui.retractionReconciliation) return;
+  ui.retractionReconciliation.innerHTML = '';
+  if (!passes?.length) {
+    ui.retractionReconciliation.textContent = 'No reconciliation pass yet.';
+    return;
+  }
+  passes.forEach((pass) => {
+    appendTraceCard(ui.retractionReconciliation, {
+      title: `Pass ${pass.pass_index ?? '-'}`,
+      pill: pass.parse_error ? 'parse error' : 'parsed',
+      tone: pass.parse_error ? 'fail' : 'pass',
+      body: `model=${pass.model || '-'}`,
+      detail: [
+        `allowed_decisions:\n${shortJson(pass.allowed_decisions || {})}`,
+        `returned_decisions:\n${shortJson(pass.decisions || [])}`,
+      ].join('\n\n'),
+    });
+  });
+}
+
+function renderRetractionVerifier(trace = state.retractionTrace.verifierTrace) {
+  if (!ui.retractionVerifier) return;
+  ui.retractionVerifier.innerHTML = '';
+  if (!trace?.length) {
+    ui.retractionVerifier.textContent = 'No verifier result yet.';
+    return;
+  }
+  trace.forEach((item) => {
+    appendTraceCard(ui.retractionVerifier, {
+      title: item.check || 'check',
+      pill: item.passed ? 'pass' : 'fail',
+      tone: item.passed ? 'pass' : 'fail',
+      body: item.message || '',
+      detail: shortJson(Object.fromEntries(Object.entries(item).filter(([key]) => !['check', 'passed', 'message'].includes(key)))),
+    });
+  });
+}
+
+function renderRetractionTraceSummary(result = null) {
+  if (!ui.retractionTraceSummary) return;
+  const trace = state.retractionTrace;
+  const status = result?.status || trace.status || 'running';
+  ui.retractionTraceSummary.textContent =
+    `${status.replace(/_/g, ' ')} | commitments ${trace.commitments.length} | packets ${trace.probePackets.length} | verifier checks ${trace.verifierTrace.length}`;
+}
+
+function renderRetractionTrace() {
+  renderRetractionTraceSummary();
+  renderRetractionCommitments();
+  renderRetractionProbePackets();
+  renderRetractionReconciliation();
+  renderRetractionVerifier();
+  renderRetractionProvenance();
+  renderRetractionBudget();
 }
 
 async function apiPost(path, payload) {
@@ -1027,7 +1281,7 @@ function renderBackend() {
   ui.backendModelRequired.textContent = info ? capabilityText(info.model_required_explicit) : '-';
   ui.backendStopSemantics.textContent = info ? capabilityText(info.stop_semantics) : '-';
   ui.backendTokenForcing.textContent = info ? capabilityText(info.strict_token_forcing) : '-';
-  ui.backendMode.textContent = 'hybrid replay / rewrite';
+  ui.backendMode.textContent = currentLabMode() === 'retraction' ? 'internal consistency retraction' : 'hybrid replay / rewrite';
 }
 
 function applyBackendInfo(info, { updateStatus = true } = {}) {
@@ -1210,12 +1464,25 @@ function resetExperimentView() {
   state.partialRuns = { baseline: null, corrected: null, rewritePreview: null };
   state.passLog = [];
   state.iterationTrace = { passes: [], finalEvidence: null };
+  resetRetractionTrace();
   state.loopBudget = 0;
   hideTokenTooltip();
   ui.experimentMeta.textContent = 'Experiment is running...';
-  ui.experimentSummary.textContent = 'Waiting for the first token-level updates from the live experiment loop.';
+  ui.experimentSummary.textContent = currentLabMode() === 'retraction'
+    ? 'Waiting for draft, commitment extraction, probes, reconciliation, and verifier checks.'
+    : 'Waiting for the first token-level updates from the live experiment loop.';
   ui.iterationTraceSummary.textContent = 'Waiting for correction loop activity.';
   ui.iterationTrace.innerHTML = '<div class=\"empty-list\">Waiting for replay, evidence, candidate, and rewrite events.</div>';
+  ui.retractionTraceSummary.textContent = 'Waiting for retraction loop activity.';
+  ui.retractionDraft.textContent = 'No draft yet.';
+  ui.retractionCommitments.textContent = 'No commitments yet.';
+  ui.retractionProbes.textContent = 'No probe packets yet.';
+  ui.retractionScoring.textContent = 'No scoring output yet.';
+  ui.retractionReconciliation.textContent = 'No reconciliation pass yet.';
+  ui.retractionFinalAnswer.textContent = 'No final answer yet.';
+  ui.retractionVerifier.textContent = 'No verifier result yet.';
+  ui.retractionProvenance.textContent = 'No provenance yet.';
+  ui.retractionBudget.textContent = 'No budget state yet.';
   ui.baselineRunId.textContent = '-';
   ui.baselineRisk.textContent = '-';
   ui.baselineAlerts.textContent = '-';
@@ -1249,6 +1516,7 @@ function resetExperimentView() {
   ui.correctedClaimLabel.textContent = '-';
   ui.correctedClaimText.textContent = '-';
   ui.correctedClaimEvidence.textContent = '-';
+  setLabModeVisibility();
 }
 
 function renderPartialInterventions() {
@@ -1296,6 +1564,115 @@ function updateProgress(event) {
   }
 }
 
+function upsertProbePacket(packet) {
+  if (!packet?.commitment_id) return;
+  const idx = state.retractionTrace.probePackets.findIndex((item) => item.commitment_id === packet.commitment_id);
+  if (idx >= 0) {
+    state.retractionTrace.probePackets[idx] = packet;
+  } else {
+    state.retractionTrace.probePackets.push(packet);
+  }
+}
+
+function handleRetractionEvent(payload) {
+  state.retractionTrace.metrics = payload.metrics || state.retractionTrace.metrics;
+  if (payload.provenance) state.retractionTrace.provenance = payload.provenance;
+
+  if (payload.type === 'retraction_experiment_started') {
+    state.retractionTrace.status = 'running';
+    ui.experimentMeta.textContent = `Mode=${payload.mode || 'internal_consistency_retraction_lab'} | experiment=${payload.experiment_id || '-'}`;
+    ui.experimentSummary.textContent = 'Draft generation started. The trace below will show each verifier loop step as it completes.';
+    renderRetractionTrace();
+    setStatus('Retraction experiment started.', 'neutral');
+    return;
+  }
+
+  if (payload.type === 'retraction_experiment_status') {
+    const waiting = asNumber(payload.waiting_ms, 0);
+    const seconds = waiting >= 1000 ? ` (${(waiting / 1000).toFixed(waiting >= 10000 ? 0 : 1)}s)` : '';
+    if (payload.message) setStatus(`${payload.message}${seconds}`, 'neutral');
+    state.retractionTrace.status = payload.phase || state.retractionTrace.status;
+    renderRetractionBudget(payload.metrics || state.retractionTrace.metrics);
+    renderRetractionTraceSummary();
+    return;
+  }
+
+  if (payload.type === 'retraction_experiment_draft') {
+    if (payload.stage === 'draft_completed') {
+      state.retractionTrace.draft = payload;
+      ui.retractionDraft.textContent =
+        `Model: ${payload.model || '-'}\nTokens: ${payload.token_budget_used ?? '-'}\nStop reason: ${payload.stop_reason || '-'}\n\n${payload.draft_answer || '-'}`;
+      ui.experimentSummary.textContent = 'Draft completed. Extracting commitments and separating model claims from user-provided context.';
+    } else if (payload.text) {
+      ui.retractionDraft.textContent = payload.text;
+    }
+    renderRetractionBudget(payload.metrics || state.retractionTrace.metrics);
+    renderRetractionTraceSummary();
+    return;
+  }
+
+  if (payload.type === 'retraction_experiment_commitments') {
+    state.retractionTrace.commitments = payload.commitments || [];
+    renderRetractionCommitments();
+    renderRetractionBudget(payload.metrics || state.retractionTrace.metrics);
+    renderRetractionTraceSummary();
+    ui.experimentSummary.textContent = `Extracted ${state.retractionTrace.commitments.length} commitments. Running probes for selected model-draft commitments.`;
+    return;
+  }
+
+  if (payload.type === 'retraction_experiment_probe') {
+    state.retractionTrace.probeEvents.push(payload);
+    if (payload.packet) upsertProbePacket(payload.packet);
+    if (payload.stage === 'probe_sample_completed' && payload.observation) {
+      const tempPacket = state.retractionTrace.probePackets.find((item) => item.commitment_id === payload.commitment_id);
+      if (!tempPacket) {
+        upsertProbePacket({
+          commitment_id: payload.commitment_id,
+          evidence_basis: 'internal_probe_consistency',
+          probe_observations: [payload.observation],
+          agreement_score: null,
+          contradiction_score: null,
+          emptiness_score: null,
+          consistency_label: 'pending',
+          deterministic_recommendation: 'pending',
+          scoring_debug: {},
+        });
+      } else if (!payload.packet) {
+        const observations = tempPacket.probe_observations || [];
+        if (!observations.some((item) => item.sample_index === payload.observation.sample_index)) {
+          tempPacket.probe_observations = [...observations, payload.observation];
+        }
+      }
+    }
+    renderRetractionProbePackets();
+    renderRetractionBudget(payload.metrics || state.retractionTrace.metrics);
+    renderRetractionTraceSummary();
+    return;
+  }
+
+  if (payload.type === 'retraction_experiment_reconciliation') {
+    if (payload.reconciliation_pass) {
+      state.retractionTrace.reconciliationPasses = [payload.reconciliation_pass];
+    }
+    if (payload.final_answer) ui.retractionFinalAnswer.textContent = payload.final_answer;
+    renderRetractionReconciliation();
+    renderRetractionProvenance(payload.provenance || state.retractionTrace.provenance);
+    renderRetractionBudget(payload.metrics || state.retractionTrace.metrics);
+    renderRetractionTraceSummary();
+    ui.experimentSummary.textContent = 'Reconciliation completed. Running deterministic behavioral verifier.';
+    return;
+  }
+
+  if (payload.type === 'retraction_experiment_completed') {
+    renderRetractionResult(payload);
+    setExperimentRunning(false);
+    setStatus(
+      payload.status === 'contract_satisfied' ? 'Retraction contract satisfied.' : `Retraction result: ${(payload.status || 'needs_review').replace(/_/g, ' ')}.`,
+      payload.status === 'contract_satisfied' ? 'success' : 'neutral',
+    );
+  }
+}
+
 function connectStream() {
   const source = new EventSource('/stream');
   source.onmessage = (message) => {
@@ -1316,6 +1693,11 @@ function connectStream() {
     }
 
     if (!payload.experiment_id || payload.experiment_id !== state.currentExperimentId) return;
+
+    if (String(payload.type).startsWith('retraction_experiment_')) {
+      handleRetractionEvent(payload);
+      return;
+    }
 
     if (payload.type === 'live_experiment_started') {
       state.loopBudget = asNumber(payload.correction_loops, 0) ?? 0;
@@ -1504,6 +1886,44 @@ function connectStream() {
   };
 }
 
+function renderRetractionResult(result) {
+  state.lastResult = result;
+  state.retractionTrace.status = result?.status || 'needs_review';
+  state.retractionTrace.commitments = result?.commitments || [];
+  state.retractionTrace.probePackets = result?.probe_packets || [];
+  state.retractionTrace.reconciliationPasses = result?.reconciliation_passes || [];
+  state.retractionTrace.verifierTrace = result?.verifier_trace || [];
+  state.retractionTrace.provenance = result?.provenance || null;
+  state.retractionTrace.metrics = result?.metrics || null;
+
+  ui.experimentMeta.textContent =
+    `Mode=${result?.mode || '-'} | status=${(result?.status || '-').replace(/_/g, ' ')} | model_calls=${result?.metrics?.model_calls ?? 0} | duration=${result?.metrics?.duration_ms ?? '-'}ms`;
+  ui.experimentSummary.textContent =
+    result?.status === 'contract_satisfied'
+      ? 'The final answer passed deterministic behavioral verification for the internal-consistency retraction contract. This is not factual verification.'
+      : `The run needs review: ${(result?.status || 'unknown').replace(/_/g, ' ')}. Inspect verifier failures and probe packets below.`;
+
+  ui.retractionDraft.textContent =
+    `Model: ${result?.provenance?.draft_model || '-'}\nTokens: ${result?.draft_run?.summary?.token_count ?? '-'}\nStop reason: ${result?.draft_run?.meta?.stop?.reason || '-'}\n\n${result?.draft_answer || '-'}`;
+  ui.retractionFinalAnswer.textContent = result?.final_answer || '-';
+
+  renderRetractionTraceSummary(result);
+  renderRetractionCommitments();
+  renderRetractionProbePackets();
+  renderRetractionReconciliation();
+  renderRetractionVerifier();
+  renderRetractionProvenance();
+  renderRetractionBudget();
+
+  const draftRun = result?.draft_run;
+  if (draftRun?.run_id) {
+    const link = new URL('./', window.location.href);
+    link.searchParams.set('runA', draftRun.run_id);
+    link.searchParams.set('focus', 'max-risk');
+    ui.openMainLink.href = link.toString();
+  }
+}
+
 function renderResult(result) {
   state.lastResult = result;
   const baseline = result?.baseline;
@@ -1616,7 +2036,11 @@ async function stopExperiment() {
   try {
     setExperimentRunning(true, { stopping: true });
     setStatus('Stop requested...', 'neutral');
-    await apiPost('/api/stop', { experiment_id: state.currentExperimentId });
+    if (currentLabMode() === 'retraction') {
+      await apiPost(`/api/retraction-experiment/${encodeURIComponent(state.currentExperimentId)}/stop`, {});
+    } else {
+      await apiPost('/api/stop', { experiment_id: state.currentExperimentId });
+    }
     setStatus('Stopping after the current backend call returns...', 'neutral');
   } catch (err) {
     setExperimentRunning(state.experimentRunning);
@@ -1627,6 +2051,7 @@ async function stopExperiment() {
 async function runExperiment() {
   const prompt = ui.prompt.value.trim();
   const baseUrl = normalizeBaseUrl(ui.endpoint.value);
+  const mode = currentLabMode();
   if (!prompt) {
     setStatus('Prompt is required.', 'error');
     return;
@@ -1645,7 +2070,7 @@ async function runExperiment() {
     n_probs: 20,
     vector_mode: ui.vectorMode.value || 'placeholder',
     vector_dim: 24,
-    chunk_size: 1,
+    chunk_size: mode === 'retraction' ? Math.max(8, Math.min(asNumber(ui.maxTokens.value, 64), 64)) : 1,
   };
 
   const policy = {
@@ -1662,17 +2087,46 @@ async function runExperiment() {
     state.currentExperimentId = `exp_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`;
     resetExperimentView();
     setExperimentRunning(true);
-    setStatus('Running baseline and replay/rewrite loops...', 'neutral');
-    const result = await apiPost('/api/live-experiment', {
-      experiment_id: state.currentExperimentId,
-      prompt,
-      base_url: baseUrl,
-      settings,
-      policy,
-    });
-    renderResult(result);
-    finalizeIterationTrace(result);
-    setStatus(result?.status === 'stopped' ? 'Experiment stopped.' : 'Experiment completed.', result?.status === 'stopped' ? 'neutral' : 'success');
+    if (mode === 'retraction') {
+      setStatus('Running internal consistency retraction loop...', 'neutral');
+      const retractionPolicy = {
+        commitment_limit: 3,
+        probe_samples_per_commitment: 3,
+        probe_answer_temperature: 0.8,
+        judge_temperature: 0.1,
+        max_total_model_calls: 18,
+        max_total_duration_ms: 180000,
+        max_probe_duration_ms: 60000,
+        max_draft_tokens: asNumber(ui.maxTokens.value, 64),
+        max_commitment_extraction_tokens: 0,
+        max_reconciliation_tokens: Math.max(220, asNumber(ui.maxTokens.value, 64) * 4),
+        on_budget_exceeded: 'return_needs_review',
+      };
+      const result = await apiPost('/api/retraction-experiment', {
+        experiment_id: state.currentExperimentId,
+        prompt,
+        base_url: baseUrl,
+        settings,
+        policy: retractionPolicy,
+      });
+      renderRetractionResult(result);
+      setStatus(
+        result?.status === 'contract_satisfied' ? 'Retraction contract satisfied.' : `Retraction result: ${(result?.status || 'needs_review').replace(/_/g, ' ')}.`,
+        result?.status === 'contract_satisfied' ? 'success' : 'neutral',
+      );
+    } else {
+      setStatus('Running baseline and replay/rewrite loops...', 'neutral');
+      const result = await apiPost('/api/live-experiment', {
+        experiment_id: state.currentExperimentId,
+        prompt,
+        base_url: baseUrl,
+        settings,
+        policy,
+      });
+      renderResult(result);
+      finalizeIterationTrace(result);
+      setStatus(result?.status === 'stopped' ? 'Experiment stopped.' : 'Experiment completed.', result?.status === 'stopped' ? 'neutral' : 'success');
+    }
   } catch (err) {
     setStatus(`Experiment failed: ${err.message}`, 'error');
   } finally {
@@ -1688,6 +2142,15 @@ async function bootstrap() {
   ui.runBtn.addEventListener('click', runExperiment);
   ui.stopBtn.addEventListener('click', stopExperiment);
   ui.probeBackendBtn.addEventListener('click', probeBackend);
+  ui.labMode.addEventListener('change', () => {
+    resetExperimentView();
+    ui.experimentMeta.textContent = 'No experiment has been run yet.';
+    ui.experimentSummary.textContent = currentLabMode() === 'retraction'
+      ? 'Run internal consistency retraction to inspect draft, commitments, probe packets, deterministic scoring, reconciliation, and verifier checks.'
+      : 'Run a baseline vs corrected decode to compare decoder-risk trajectory and intervention count.';
+    setLabModeVisibility();
+    renderBackend();
+  });
   ui.endpoint.addEventListener('blur', () => {
     const normalized = normalizeBaseUrl(ui.endpoint.value);
     if (normalized) ui.endpoint.value = normalized;
@@ -1696,6 +2159,7 @@ async function bootstrap() {
   window.addEventListener('resize', hideTokenTooltip);
 
   connectStream();
+  setLabModeVisibility();
   if (status?.backend_probe?.base_url) {
     applyBackendInfo(status.backend_probe);
   }
